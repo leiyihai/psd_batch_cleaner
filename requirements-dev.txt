@@ -1,0 +1,4 @@
+-r requirements.txt
+mypy==2.4.1
+psutil==7.2.2
+pywin32==312; sys_platform == "win32"

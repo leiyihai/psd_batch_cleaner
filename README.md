@@ -66,6 +66,22 @@
    - 选择 PsDeepCleanerPlusForFolder.jsx 对指定路径下所有指定格式的文件处理。
 4. 根据提示执行脚本。
 
+## Python 批处理验证原型（开发中）
+
+新增基于 `psd-tools` 的独立文件清理原型，正常清理无需启动 Photoshop。支持递归处理嵌入的 PSD/PSB，只删除 `DocumentAncestors`，保留外链及其他元数据；非 PSD 嵌入内容会标为部分清理。
+
+目前是 GUI 开发前的验证阶段。三份 0.91–2.80 GB 的真实设计稿已通过文件区间清理及自动保真检查，加入图层及合成图校验后的峰值工作集约 162–200 MiB；**完整 Photoshop 深层可编辑性验收仍未完成，不建议用于无人值守生产批处理**。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m prototype.batch --input "D:\测试输入" --output "D:\测试输出"
+```
+
+输入和输出目录必须独立、不得相互包含。原文件不覆盖；输出按每次运行的独立子目录保存，并保留输入子目录结构。完整成功且源内容、规则与输出副本均未变化时，后续运行通过 SHA-256 增量判断复用历史输出。
+
+真实样本、与 JSX 参考的差异、复现命令和未完成验收见 [真实文件验收记录](docs/real-file-acceptance.md)，早期小样本验证见 [原型验证记录](docs/prototype-validation.md)。大文件批处理使用文件区间补丁，逐块验证未修改字节，不对整份文档重序列化。桌面 GUI 和并行模式尚未实现。
+
 ## 参考链接
 
 - https://marketplace.visualstudio.com/items?itemName=Adobe.extendscript-debug

@@ -1,5 +1,5 @@
 ﻿#include "Common.jsxinc"
-#include "CleanerCore.jsx"
+#include "CleanerCore.jsxinc"
 
 
 function main(){
