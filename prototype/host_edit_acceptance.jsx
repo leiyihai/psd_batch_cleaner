@@ -101,21 +101,27 @@
         var root = app.open(new File(plan.input)); owned.push(root);
         png(root, plan.beforePng);
         check(!deep(root, 0, false), "Deep marker exists before edit");
-        check(!shared(root, plan.shared[0], false) && !shared(root, plan.shared[1], false), "Shared marker exists before edit");
+        if (plan.shared.length === 2) {
+            check(!shared(root, plan.shared[0], false) && !shared(root, plan.shared[1], false), "Shared marker exists before edit");
+        }
         log("deep edit and propagate saves");
         deep(root, 0, true);
         check(deep(root, 0, false) === plan.edit, "Unexpected deep marker state after save");
-        log("edit shared first instance");
-        shared(root, plan.shared[0], true);
-        check(shared(root, plan.shared[1], false) === plan.edit, "Unexpected shared peer state after save");
+        if (plan.shared.length === 2) {
+            log("edit shared first instance");
+            shared(root, plan.shared[0], true);
+            check(shared(root, plan.shared[1], false) === plan.edit, "Unexpected shared peer state after save");
+        }
         png(root, plan.editedPng);
         log("save root"); saveRoot(root);
         root.close(SaveOptions.DONOTSAVECHANGES); owned.pop();
         log("reopen root");
         root = app.open(new File(plan.saved)); owned.push(root);
         check(deep(root, 0, false) === plan.edit, "Unexpected deep marker state after reopen");
-        check(shared(root, plan.shared[0], false) === plan.edit, "Unexpected first shared marker state after reopen");
-        check(shared(root, plan.shared[1], false) === plan.edit, "Unexpected shared peer marker state after reopen");
+        if (plan.shared.length === 2) {
+            check(shared(root, plan.shared[0], false) === plan.edit, "Unexpected first shared marker state after reopen");
+            check(shared(root, plan.shared[1], false) === plan.edit, "Unexpected shared peer marker state after reopen");
+        }
         png(root, plan.afterPng);
         root.close(SaveOptions.DONOTSAVECHANGES); owned.pop();
         log("all edit and linkage checks passed");

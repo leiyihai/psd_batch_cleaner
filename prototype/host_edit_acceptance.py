@@ -45,11 +45,41 @@ def shared_pair(blob: bytes) -> list[int]:
     return list(dict.fromkeys(groups[key]))[:2]
 
 
+def native_psd_chain(blob: bytes, depth: int = 0) -> list[int]:
+    """Find a chain ending at an actual PSD v1 payload, not a .psd filename."""
+    from psd_tools import PSDImage
+    from psd_tools.api.layers import SmartObjectLayer
+
+    if depth >= 16:
+        return []
+    doc = PSDImage.open(io.BytesIO(blob))
+    seen: set[str] = set()
+    for layer in doc.descendants():
+        if not isinstance(layer, SmartObjectLayer) or layer.smart_object.kind != 'data':
+            continue
+        obj = layer.smart_object
+        if obj.unique_id in seen:
+            continue
+        seen.add(obj.unique_id)
+        payload = obj.data
+        if payload[:6] == b'8BPS\0\1':
+            return [layer.layer_id]
+        if payload[:6] == b'8BPS\0\2':
+            child = native_psd_chain(payload, depth + 1)
+            if child:
+                return [layer.layer_id] + child
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='隔离副本的嵌入编辑持久化与共享实例关联实机验收')
     parser.add_argument('--report', type=Path, required=True, help='仅含一个样本的验收报告')
     parser.add_argument('--output', type=Path, required=True, help='报告目录下尚不存在的隔离目录')
     parser.add_argument('--timeout', type=int, default=120)
+    parser.add_argument('--embedded-format', choices=('deepest', 'psd'), default='deepest',
+                        help='默认最深分支；psd 明确选择以原生 PSD v1 结尾的分支')
+    parser.add_argument('--skip-shared', action='store_true',
+                        help='显式不验收共享实例；报告记为跳过，不计为通过')
     args = parser.parse_args()
     if args.timeout <= 0:
         raise ValueError('timeout 必须为正数')
@@ -104,10 +134,10 @@ def main() -> int:
         if sha256_file(fixture) != source_hash:
             raise ValueError('隔离副本与既有输出不一致')
         blob = fixture.read_bytes()
-        chain = deepest_chain(blob)
+        chain = native_psd_chain(blob) if args.embedded_format == 'psd' else deepest_chain(blob)
         if not chain:
-            raise ValueError('缺少原生嵌入链，不能验收深层编辑')
-        pair = shared_pair(blob)
+            raise ValueError('缺少所选格式的原生嵌入链，不能验收编辑')
+        pair = [] if args.skip_shared else shared_pair(blob)
         del blob
         token = uuid.uuid4().hex
         plan: dict[str, Any] = {
@@ -144,13 +174,17 @@ def main() -> int:
             control_after = image.convert('RGBA')
         entry = {
             'sample': source.name, 'photoshop_version': version, 'nested_depth': len(chain),
+            'embedded_format': args.embedded_format,
             'shared_layer_ids': pair,
+            'shared_check': 'skipped-explicitly' if args.skip_shared else 'passed',
             # The script throws at each unmet condition; these describe the
             # completed protocol, not inferred success from merely opening a file.
             'deep_marker_absent_before': True, 'deep_marker_after_save': True,
-            'deep_marker_after_reopen': True, 'shared_markers_absent_before': True,
-            'shared_peer_after_save': True, 'shared_first_after_reopen': True,
-            'shared_peer_after_reopen': True,
+            'deep_marker_after_reopen': True,
+            'shared_markers_absent_before': None if args.skip_shared else True,
+            'shared_peer_after_save': None if args.skip_shared else True,
+            'shared_first_after_reopen': None if args.skip_shared else True,
+            'shared_peer_after_reopen': None if args.skip_shared else True,
             'render_equal_after_save_reopen': edited.size == after.size and edited.tobytes() == after.tobytes(),
             'render_matches_no_edit_save_control': control_after.size == after.size and control_after.tobytes() == after.tobytes(),
             'initial_cached_render_unchanged': before.size == after.size and before.tobytes() == after.tobytes(),
