@@ -1,7 +1,8 @@
-"""Serial CLI validation harness, not the final GUI. Outputs never replace source files."""
+"""Shared serial batch engine and CLI. Outputs never replace source files."""
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
@@ -10,7 +11,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from prototype.cleaner import RULE_VERSION
 from prototype.file_cleaner import clean_file
@@ -28,11 +29,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def discover(root: Path):
+def discover(root: Path, *, recursive: bool = True):
     def fail(error):
         raise error
     for current, directories, names in os.walk(root, followlinks=False, onerror=fail):
-        directories[:] = sorted(d for d in directories if not Path(current, d).is_symlink())
+        directories[:] = sorted(d for d in directories if not Path(current, d).is_symlink()) if recursive else []
         for name in sorted(names):
             path = Path(current, name)
             if path.suffix.lower() in (".psd", ".psb") and not path.is_symlink():
@@ -53,8 +54,38 @@ def atomic_json(path, value):
             temporary.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class BatchEvent:
+    """Shared progress/result notification; observers must not alter the row."""
+    kind: str
+    phase: str = ''
+    source: Path | None = None
+    row: dict[str, Any] | None = None
+    report: Path | None = None
+    message: str = ''
+
+
 def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
-        selected_files: set[Path] | None = None):
+        selected_files: set[Path] | None = None, recursive: bool = True,
+        on_event: Callable[[BatchEvent], None] | None = None):
+    notify = on_event if on_event is not None else lambda event: None
+    try:
+        notify(BatchEvent('phase', phase='扫描文件'))
+        rows, report = _run(input_dir, output_dir, stop=stop, emit=emit,
+                            selected_files=selected_files, recursive=recursive, notify=notify)
+    except Exception as exc:
+        notify(BatchEvent('error', message=str(exc)))
+        raise
+    notify(BatchEvent('finished', report=report))
+    return rows, report
+
+
+def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], None], stop=None, emit=print,
+         selected_files: set[Path] | None = None, recursive: bool = True):
+    def announce_phase(name: str, source: Path) -> None:
+        notify(BatchEvent('phase', phase=name, source=source))
+        emit(f"{name}：{source}")
+
     root, output = input_dir.resolve(), output_dir.resolve()
     if not root.is_dir():
         raise ValueError("输入目录不存在")
@@ -79,7 +110,7 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
         run_dir.mkdir()
         rows = []
         report = run_dir / "report.json"
-        for source in discover(root):
+        for source in discover(root, recursive=recursive):
             if selection is not None and source not in selection:
                 continue
             if stop.is_set():
@@ -88,7 +119,7 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
             started = time.perf_counter()
             infrastructure_error: RuntimeError | None = None
             try:
-                emit(f"检查变化：{source}")
+                announce_phase('检查变化', source)
                 digest = sha256_file(source)
                 key = str(source)
                 previous = cache.get(key, {})
@@ -102,11 +133,11 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
                         raise ValueError("输入在验证历史输出期间发生变化，稍后重试")
                     row.update(status="未变化", output=str(prior_path))
                 else:
-                    emit(f"清理中：{source}")
+                    announce_phase('清理中', source)
                     before = source.stat().st_size
                     with tempfile.TemporaryDirectory(dir=run_dir) as temporary:
                         staged = Path(temporary) / "result.tmp"
-                        result = clean_file(source, staged)
+                        result = clean_file(source, staged, on_validate=lambda: announce_phase('校验中', source))
                         output_hash = sha256_file(staged)
                         if sha256_file(source) != digest:
                             raise ValueError("输入在清理期间发生变化，取消发布")
@@ -133,6 +164,7 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
             row["elapsed_seconds"] = round(time.perf_counter() - started, 6)
             rows.append(row)
             atomic_json(report, rows)
+            notify(BatchEvent('file', source=source, row=dict(row), report=report))
             emit(f"{row['status']}：{source}" + (f"；{row['error']}" if "error" in row else ""))
             if infrastructure_error is not None:
                 raise infrastructure_error
@@ -144,7 +176,7 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PSD/PSB 深度清理验证原型（尚未通过 Photoshop 验收）")
+    parser = argparse.ArgumentParser(description="PSD/PSB 串行批处理：生成独立瘦身副本")
     parser.add_argument("--input", type=Path, required=True, help="输入目录，递归扫描 PSD/PSB")
     parser.add_argument("--output", type=Path, required=True, help="独立输出目录；每次运行生成新子目录")
     args = parser.parse_args()

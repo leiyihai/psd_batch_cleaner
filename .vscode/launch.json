@@ -4,6 +4,14 @@
         {
             "type": "debugpy",
             "request": "launch",
+            "name": "Python：中文串行窗口",
+            "module": "prototype.gui",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
             "name": "Python：自动回归测试",
             "module": "unittest",
             "args": ["discover", "-s", "tests", "-v"],

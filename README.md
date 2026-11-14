@@ -2,7 +2,7 @@
 
 基于 Python 和 `psd-tools` 的 PSD/PSB 深度清理项目：删除主文档及受支持嵌入式智能对象中的 Photoshop XMP `DocumentAncestors`（文档祖先元数据），生成独立瘦身副本。**正常清理不需要启动或调用 Photoshop。**
 
-> **当前为开发阶段，不是已完成的桌面应用。** 工单 01、02 已完成约定验收，GUI 03–08 和并行模式尚未实现；这些验收不构成任意文件绝对无损或可直接无人值守生产运行的承诺。
+> **当前为开发阶段，不是已完成的桌面应用。** 工单 01–03 已完成约定验收，已提供最小中文串行窗口；04–08 的递归选项、安全停止、完整结果/导出及整体验收和并行模式尚未实现；这些验收不构成任意文件绝对无损或可直接无人值守生产运行的承诺。
 
 ## 当前能力与边界
 
@@ -22,10 +22,18 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m prototype.gui
+```
+
+窗口提供目录填写/浏览、开始、阶段与当前文件、基本结果及错误详情。**目前只扫描输入目录当前层级，不包含子目录；嵌入式智能对象仍按既有规则深度清理。** 运行中参数锁定，尚无停止按钮，关闭操作提示等待本轮安全完成。Tkinter/ttk随带Tcl/Tk的Python提供，无需额外GUI包；精简Python缺少该组件时需先安装Tcl/Tk。
+
+非交互串行入口仍可使用：
+
+```powershell
 .\.venv\Scripts\python.exe -m prototype.batch --input "D:\输入" --output "D:\独立输出"
 ```
 
-默认扫描子文件夹，识别 PSD/PSB。每次运行创建独立输出子目录；增量命中返回历史输出引用，并不在本轮重复复制一套结果。请避免在处理期间修改输入文件。
+CLI 默认扫描子文件夹，识别 PSD/PSB。每次运行创建独立输出子目录；增量命中返回历史输出引用，并不在本轮重复复制一套结果。请避免在处理期间修改输入文件。
 
 首次使用请先备份素材并用少量副本验证。正常清理只需 `requirements.txt`；开发、资源测量及可选 Photoshop 验收使用 `requirements-dev.txt`。
 
@@ -34,16 +42,16 @@ python -m venv .venv
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py
+.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py prototype/gui.py
 ```
 
-普通自动测试不调用 Photoshop。真实样本、资源测量和宿主验收的命令及安全要求见 [真实文件验收记录](docs/real-file-acceptance.md)。宿主验收必须显式执行，使用已有且无文档的空闲 Photoshop 会话；watchdog 退出不等于取消 Photoshop 脚本，超时后不得自动重试。
+普通自动测试不调用 Photoshop；真实Tk控件测试需要Tcl/Tk和可用桌面，无显示时明确跳过，不视为GUI验收通过。真实样本、资源测量和宿主验收的命令及安全要求见 [真实文件验收记录](docs/real-file-acceptance.md)。宿主验收必须显式执行，使用已有且无文档的空闲 Photoshop 会话；watchdog 退出不等于取消 Photoshop 脚本，超时后不得自动重试。
 
 ## 项目导航
 
 | 路径 | 用途 |
 | --- | --- |
-| `prototype/` | Python 清理、批处理与验收模块；沿用现有模块名和 `python -m prototype.batch` 入口 |
+| `prototype/` | 共享Python清理/批处理、最小窗口（`python -m prototype.gui`）及验收模块 |
 | `tests/` | 自动回归测试 |
 | `docs/` | 当前验收记录、历史验证、架构决策及协作配置 |
 | `GLOSSARY.md` | 领域术语 |
@@ -54,7 +62,8 @@ python -m venv .venv
 
 - [目录布局与重命名说明](docs/project-layout.md)
 - [真实文件早期验收记录](docs/real-file-acceptance.md)：保留当时的失败与资源测量记录
-- [01 最终验收](docs/ticket01-closeout.md)、[02 最终验收](docs/ticket02-closeout.md)：当前完成结论与支持边界
+- [01 最终验收](docs/ticket01-closeout.md)、[02 最终验收](docs/ticket02-closeout.md)：内容安全结论与支持边界
+- [03 最终验收](docs/ticket03-closeout.md)：最小窗口、共享事件、启动命令及真实GUI冒烟
 - [历史小样本验证](docs/prototype-validation.md)：早期记录，不代表当前批处理限制
 - [文件区间补丁 ADR](docs/adr/0001-stream-metadata-patches.md)
 - [规格与工单导航](docs/spec-psd-batch-cleaner.md)

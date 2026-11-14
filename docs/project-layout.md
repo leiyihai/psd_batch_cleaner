@@ -2,7 +2,7 @@
 
 ## 当前整理状态
 
-工作目录现已位于 `E:\psd_batch_cleaner`，旧 JSX 和参考资料位于 `legacy/photoshop/`；当前 `.venv/Scripts/python.exe` 可运行测试和验收。01、02 的约定验收已完成，见 [01最终记录](ticket01-closeout.md)、[02最终记录](ticket02-closeout.md)。
+工作目录现已位于 `E:\psd_batch_cleaner`，旧 JSX 和参考资料位于 `legacy/photoshop/`；当前 `.venv/Scripts/python.exe` 可运行测试和验收。01–03 的约定验收已完成，见 [01最终记录](ticket01-closeout.md)、[02最终记录](ticket02-closeout.md)、[03最小窗口验收](ticket03-closeout.md)。
 
 下文保留早期迁移准备步骤。当前没有 `.prototype-data/relocated/` 派生目录，也没有完整169文件迁移清单的后验通过记录；不能把目录已改名或当前测试通过说成所有迁移计划均已执行。历史报告中的旧路径保持原样，后续验收使用各自记录的新隔离副本和派生报告。
 
@@ -25,7 +25,7 @@ Rename-Item -LiteralPath 'E:\photoshop_deep_cleaner_plus' -NewName 'psd_batch_cl
 
 项目名称为 **PSD Batch Cleaner（PSD 批量瘦身工具）**，本机根目录目标为 `E:\psd_batch_cleaner`，原名为 `E:\photoshop_deep_cleaner_plus`。用户已确认此次整理与重命名；它不改变清理规则、工单状态或 GUI 的实施顺序。
 
-保留 `prototype` 包名，以兼容现有导入、测试和 CLI 命令。本次不迁移为 `src/` 布局、不引入新 GUI，也不重新实现清理逻辑。
+保留 `prototype` 包名，以兼容现有导入、测试和 CLI 命令。目录整理没有迁移为 `src/` 布局或重新实现清理逻辑；后续03已独立交付最小GUI，仍复用现有批处理。
 
 ## 目录职责
 
@@ -35,7 +35,8 @@ psd_batch_cleaner/
 ├── AGENTS.md / GLOSSARY.md        # 协作入口、领域术语
 ├── requirements*.txt             # 运行及开发依赖
 ├── prototype/                    # Python 清理、批处理与验收
-│   ├── batch.py                  # 实际批处理公共入口
+│   ├── batch.py                  # GUI/CLI共享批处理、扫描参数和事件
+│   ├── gui.py                    # 最小中文串行窗口（当前目录）
 │   ├── file_cleaner.py           # 当前文件区间补丁路径
 │   ├── cleaner.py                # XMP 清理、旧内存原型回归
 │   ├── acceptance.py             # 真实文件自动验收和资源监测

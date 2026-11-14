@@ -10,7 +10,7 @@ from pathlib import Path
 import os
 import struct
 import zlib
-from typing import BinaryIO, Any, cast
+from typing import BinaryIO, Any, Callable, cast
 
 from psd_tools.constants import Tag
 from psd_tools.psd.header import FileHeader
@@ -397,7 +397,7 @@ def verify_ranges(source: Path, output: Path, patches: list[Patch]) -> None:
             raise UnsafeFile("输出长度不一致")
 
 
-def clean_file(source: Path, output: Path) -> FileResult:
+def clean_file(source: Path, output: Path, *, on_validate: Callable[[], None] | None = None) -> FileResult:
     """Write an exclusive temporary result; caller publishes it only after source recheck."""
     patches, result = plan_file(source)
     created = False
@@ -413,6 +413,8 @@ def clean_file(source: Path, output: Path) -> FileResult:
             copy_exact(original, destination, source.stat().st_size - cursor)
             destination.flush()
             os.fsync(destination.fileno())
+        if on_validate is not None:
+            on_validate()
         verify_ranges(source, output, patches)
         remaining, verified = plan_file(output)
         if remaining or verified.removed:
