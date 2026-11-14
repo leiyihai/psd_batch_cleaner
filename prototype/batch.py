@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import threading
 import time
@@ -65,6 +65,23 @@ def atomic_json(path, value):
             temporary.unlink(missing_ok=True)
 
 
+class InvalidCache(RuntimeError):
+    """Unreliable incremental records must never be treated as cache misses."""
+
+
+def _cache_output_path(output: Path, reference: Any) -> Path:
+    if not isinstance(reference, str) or not reference or '\x00' in reference:
+        raise InvalidCache('增量记录输出引用无效，原记录已保留。')
+    relative, windows = Path(reference), PureWindowsPath(reference)
+    if (relative.is_absolute() or windows.drive or windows.root
+            or '..' in relative.parts or '..' in windows.parts):
+        raise InvalidCache(f'增量记录输出引用必须是输出目录内的相对路径：{reference}')
+    resolved = (output / relative).resolve()
+    if output not in resolved.parents:
+        raise InvalidCache(f'增量记录输出引用越界：{reference}')
+    return resolved
+
+
 @dataclass(frozen=True)
 class BatchEvent:
     """Shared progress/result notification; observers must not alter the row."""
@@ -119,9 +136,27 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
         with stream:
             stream.write(str(os.getpid()))
         manifest = output / ".cleaner-cache.json"
-        cache = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-        if not isinstance(cache, dict):
-            raise ValueError("增量记录格式错误")
+        try:
+            cache = json.loads(manifest.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            cache = {}
+        except (ValueError, OSError) as exc:
+            raise InvalidCache(f'增量记录读取失败：{manifest}；{exc}') from exc
+        if not isinstance(cache, dict) or any(not isinstance(record, dict) for record in cache.values()):
+            raise InvalidCache('增量记录格式错误：每项记录必须是对象，原记录已保留。')
+        for key, record in cache.items():
+            if not Path(key).is_absolute() or '\x00' in key:
+                raise InvalidCache(f'增量记录源身份无效：{key}')
+            for field in ('rule', 'source_hash', 'output_hash', 'status', 'output'):
+                if not isinstance(record.get(field), str) or not record[field]:
+                    raise InvalidCache(f'增量记录字段缺失或格式错误：{key}；{field}')
+            for field in ('source_hash', 'output_hash'):
+                digest = record[field]
+                if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+                    raise InvalidCache(f'增量记录 SHA-256 格式错误：{key}；{field}')
+            if record['status'] not in ('成功', '无需清理'):
+                raise InvalidCache(f'增量记录不允许复用此状态：{key}；{record["status"]}')
+            _cache_output_path(output, record['output'])
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         run_dir = output / run_name
         run_dir.mkdir()
@@ -146,9 +181,9 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 digest = sha256_file(source)
                 key = str(source)
                 previous = cache.get(key, {})
-                prior_path = output / previous.get("output", "")
-                # Never trust a cache path outside the designated output directory.
                 accessing_output = True
+                # Recheck containment at use time as well as on cache load.
+                prior_path = _cache_output_path(output, previous['output']) if previous else output
                 cached = (previous.get("rule") == RULE_VERSION and previous.get("source_hash") == digest
                           and previous.get("status") in ("成功", "无需清理")
                           and output in prior_path.resolve().parents)
@@ -201,7 +236,9 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 # psd-tools also raises OSError without errno for malformed
                 # content. Only actual OS I/O errors here indicate a potentially
                 # unavailable output volume; parser rejections remain per-file.
-                if accessing_output and isinstance(exc, OSError) and exc.errno is not None:
+                if isinstance(exc, InvalidCache):
+                    infrastructure_error = exc
+                elif accessing_output and isinstance(exc, OSError) and exc.errno is not None:
                     infrastructure_error = RuntimeError(f'输出读写或发布失败，任务终止：{exc}')
                 row["status"] = "失败"
                 row["error"] = str(infrastructure_error or exc)

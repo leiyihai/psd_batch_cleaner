@@ -13,6 +13,9 @@ from typing import Any
 from prototype.batch import BatchEvent, run
 
 
+INCREMENTAL_NOTE = '检查变化需完整读盘计算源文件及历史副本的 SHA-256；未变化不等于零耗时。'
+
+
 class CleanerWindow(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=24)
@@ -22,7 +25,7 @@ class CleanerWindow(ttk.Frame):
         self.phase = tk.StringVar(master, '就绪')
         self.current_file = tk.StringVar(master, '尚未开始')
         self.report_path = tk.StringVar(master)
-        self.summary = tk.StringVar(master, '默认包含子文件夹；瘦身副本保留输入相对路径。')
+        self.summary = tk.StringVar(master, INCREMENTAL_NOTE)
         self._messages: queue.Queue[BatchEvent] = queue.Queue()
         self._running = False
         self._stop = threading.Event()
@@ -65,7 +68,7 @@ class CleanerWindow(ttk.Frame):
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
         self.results = ttk.Treeview(table, columns=('status', 'source', 'output'), show='headings', height=7)
-        for key, title, width in [('status', '结果', 100), ('source', '输入文件', 330), ('output', '输出位置', 400)]:
+        for key, title, width in [('status', '结果', 100), ('source', '输入文件', 330), ('output', '输出位置（含历史副本）', 400)]:
             self.results.heading(key, text=title)
             self.results.column(key, width=width, minwidth=80)
         self.results.grid(row=0, column=0, sticky='nsew')
@@ -123,7 +126,8 @@ class CleanerWindow(ttk.Frame):
             area.configure(state='disabled')
         self.report_path.set('')
         self.current_file.set('准备检查目录…')
-        self.summary.set('串行处理中；原稿不覆盖。当前任务参数已锁定。')
+        self.summary.set(INCREMENTAL_NOTE + ' 当前任务参数已锁定。')
+        self._log(INCREMENTAL_NOTE)
         self.phase.set('准备中')
         self._stop = threading.Event()
         self._set_busy(True)
@@ -201,12 +205,15 @@ class CleanerWindow(ttk.Frame):
             self._set_busy(False)
             failed = sum(row['status'] == '失败' for row in self._rows.values())
             partial = sum(row['status'] == '部分清理' for row in self._rows.values())
+            reused = sum(row['status'] == '未变化' for row in self._rows.values())
             if event.kind == 'stopped':
                 self.phase.set('已停止')
                 self.summary.set(f'已停止：处理 {event.completed} / {event.total} 个文件，未处理 {(event.total or 0) - event.completed} 个；失败 {failed} 个，部分清理 {partial} 个。')
             else:
                 self.phase.set('处理结束（存在失败）' if failed else '处理结束（存在部分清理）' if partial else '处理完成')
                 self.summary.set(f'本轮 {event.completed} / {event.total} 个文件，失败 {failed} 个，部分清理 {partial} 个。' if self._rows else '本轮扫描范围内没有可处理的 PSD / PSB 文件（0 / 0）。')
+            if self._rows:
+                self.summary.set(self.summary.get() + f' 历史复用 {reused} 个，不在本轮重复复制；实际输出以逐文件路径为准。')
             self.report_path.set(str(event.report or ''))
             self._log(self.phase.get() + '；' + self.summary.get())
 
@@ -216,6 +223,8 @@ class CleanerWindow(ttk.Frame):
             return
         row = self._rows[selection[0]]
         text = f"状态：{row['status']}"
+        if row['status'] == '未变化':
+            text += '\n复用历史副本：源内容、规则和输出校验一致；本轮未重复清理或复制。'
         if row.get('error'):
             text += '\n错误：' + row['error']
         text += f"\n输入：{row['source']}\n输出：{row['output'] or '未发布'}"

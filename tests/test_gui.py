@@ -1,4 +1,6 @@
 """Real Tk widgets -> shared batch -> filesystem; no mocked cleaning logic."""
+from contextlib import nullcontext
+import gc
 import io
 import json
 import threading
@@ -18,6 +20,9 @@ from fs_faults import fail_report_update_at
 
 class GuiTests(unittest.TestCase):
     def setUp(self):
+        # Prior unittest cases can leave unreachable Tk cycles. Reclaim them
+        # on Tk's owner thread before a new worker can trigger cyclic GC.
+        gc.collect()
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
@@ -50,6 +55,241 @@ class GuiTests(unittest.TestCase):
             self.root.update()
             time.sleep(.01)
         self.assertTrue(event.is_set(), 'filesystem gate was not entered')
+
+    def test_incremental_second_run_explains_full_hashing_and_historical_outputs(self):
+        originals = {'a.PSD': tiny(), 'b.PSB': tiny(2, xmp=None)}
+        for name, content in originals.items():
+            (self.inputs / name).write_bytes(content)
+        self.assertIn('完整读盘', self.app.summary.get())
+        self.app.start_button.invoke()
+        self.finish()
+        first_report = Path(self.app.report_path.get())
+        first = json.loads(first_report.read_text(encoding='utf-8'))
+        self.assertEqual([r['status'] for r in first], ['成功', '无需清理'])
+        historical = [r['output'] for r in first]
+        before = {path: Path(path).read_bytes() for path in historical}
+        self.app.start_button.invoke()
+        self.finish()
+        report = Path(self.app.report_path.get())
+        second = json.loads(report.read_text(encoding='utf-8'))
+        self.assertEqual([r['status'] for r in second], ['未变化', '未变化'])
+        self.assertEqual([r['output'] for r in second], historical)
+        self.assertFalse((report.parent / 'files').exists())
+        self.assertIn('历史复用 2', self.app.summary.get())
+        self.assertIn('不在本轮重复复制', self.app.summary.get())
+        self.assertIn('复用历史副本', self.app.details.get('1.0', 'end'))
+        self.assertIn(historical[-1], self.app.details.get('1.0', 'end'))
+        activity = self.app.activity.get('1.0', 'end')
+        self.assertIn('检查变化', activity)
+        self.assertIn('完整读盘', activity)
+        self.assertNotIn('清理中', activity)
+        self.assertNotIn('校验中', activity)
+        for path, content in before.items():
+            self.assertEqual(Path(path).read_bytes(), content)
+        for name, content in originals.items():
+            self.assertEqual((self.inputs / name).read_bytes(), content)
+
+    def test_incremental_invalidation_from_gui_preserves_independent_outputs(self):
+        source = self.inputs / '设计.PsB'
+        original = tiny(2)
+        for reason in ('same-size-time', 'rule', 'missing', 'tampered'):
+            with self.subTest(reason=reason):
+                output = self.base / reason
+                self.app.output_path.set(str(output))
+                source.write_bytes(original)
+                self.app.start_button.invoke()
+                self.finish()
+                first_report = Path(self.app.report_path.get())
+                first = json.loads(first_report.read_text(encoding='utf-8'))[0]
+                historical = Path(first['output'])
+                old_output, old_report = historical.read_bytes(), first_report.read_bytes()
+                if reason == 'same-size-time':
+                    before = source.stat()
+                    source.write_bytes(original.replace(b'Shanghai', b'Shenzhen'))
+                    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    self.assertEqual((source.stat().st_size, source.stat().st_mtime_ns),
+                                     (before.st_size, before.st_mtime_ns))
+                elif reason == 'missing':
+                    historical.unlink()
+                elif reason == 'tampered':
+                    historical.write_bytes(b'tampered historical output')
+                with patch('prototype.batch.RULE_VERSION', 'ticket06-new-rule') if reason == 'rule' else nullcontext():
+                    self.app.start_button.invoke()
+                    self.finish()
+                report = Path(self.app.report_path.get())
+                second = json.loads(report.read_text(encoding='utf-8'))[0]
+                self.assertEqual(second['status'], '成功')
+                self.assertNotEqual(second['output'], first['output'])
+                self.assertTrue(Path(second['output']).is_file())
+                self.assertIn(report.parent, Path(second['output']).parents)
+                self.assertEqual(first_report.read_bytes(), old_report)
+                self.assertIn('清理中', self.app.activity.get('1.0', 'end'))
+                if reason not in ('missing', 'tampered'):
+                    self.assertEqual(historical.read_bytes(), old_output)
+                expected = original.replace(b'Shanghai', b'Shenzhen') if reason == 'same-size-time' else original
+                self.assertEqual(source.read_bytes(), expected)
+
+    def test_failed_and_partial_files_retry_instead_of_becoming_incremental_hits(self):
+        bad, partial, normal = self.inputs / 'a.psd', self.inputs / 'b.psd', self.inputs / 'c.psd'
+        bad.write_bytes(b'not PSD')
+        partial.write_bytes(tiny(children=[embedded(b'%PDF opaque')]))
+        normal.write_bytes(tiny(xmp=None))
+        self.app.start_button.invoke()
+        self.finish()
+        first = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual([r['status'] for r in first], ['失败', '部分清理', '无需清理'])
+        self.app.start_button.invoke()
+        self.finish()
+        second = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual([r['status'] for r in second], ['失败', '部分清理', '未变化'])
+        self.assertNotEqual(first[1]['output'], second[1]['output'])
+        self.assertTrue(second[1]['issues'])
+        self.assertTrue(Path(first[1]['output']).is_file())
+        self.assertTrue(Path(second[1]['output']).is_file())
+        manifest = self.output / '.cleaner-cache.json'
+        self.assertEqual(set(json.loads(manifest.read_text(encoding='utf-8'))), {str(normal.resolve())})
+        bad.write_bytes(tiny())
+        partial.write_bytes(tiny())
+        self.app.start_button.invoke()
+        self.finish()
+        repaired = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual([r['status'] for r in repaired], ['成功', '成功', '未变化'])
+
+    def test_input_changes_during_hash_history_or_cleaning_never_reuse_or_publish_stale_output(self):
+        source = self.inputs / 'a.psd'
+        original = tiny()
+        changed = original.replace(b'Shanghai', b'Shenzhen')
+        path_open = Path.open
+        for stage in ('hash', 'history', 'clean'):
+            with self.subTest(stage=stage):
+                output = self.base / stage
+                self.app.output_path.set(str(output))
+                source.write_bytes(original)
+                self.app.start_button.invoke()
+                self.finish()
+                historical = Path(json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))[0]['output'])
+                old_output = historical.read_bytes()
+                manifest = output / '.cleaner-cache.json'
+                if stage == 'clean':
+                    records = json.loads(manifest.read_text(encoding='utf-8'))
+                    records[str(source.resolve())]['rule'] = 'older-rule'
+                    manifest.write_text(json.dumps(records), encoding='utf-8')
+                old_cache = manifest.read_bytes()
+                before = source.stat()
+                mutated = False
+
+                def mutate():
+                    nonlocal mutated
+                    if not mutated:
+                        mutated = True
+                        source.write_bytes(changed)
+                        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+                def racing_open(path, mode='r', *args, **kwargs):
+                    stream = path_open(path, mode, *args, **kwargs)
+                    if mode == 'rb' and stage == 'hash' and path == source.resolve() and not mutated:
+                        read = stream.read
+
+                        def read_then_change(size=-1):
+                            data = read(size)
+                            mutate()
+                            return data
+
+                        stream.read = read_then_change
+                    elif mode == 'rb' and ((stage == 'history' and path == historical)
+                                           or (stage == 'clean' and path.name == 'result.tmp')):
+                        mutate()
+                    return stream
+
+                with patch('pathlib.Path.open', new=racing_open):
+                    self.app.start_button.invoke()
+                    self.finish()
+                self.assertTrue(mutated)
+                rows = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+                self.assertEqual(rows[0]['status'], '失败')
+                self.assertIsNone(rows[0]['output'])
+                self.assertRegex(rows[0]['error'], '发生变化|校验失败')
+                self.assertEqual(self.app.phase.get(), '处理结束（存在失败）')
+                self.assertFalse((Path(self.app.report_path.get()).parent / 'files').exists())
+                self.assertEqual(historical.read_bytes(), old_output)
+                self.assertEqual(manifest.read_bytes(), old_cache)
+                self.assertEqual(source.read_bytes(), changed)
+                self.app.start_button.invoke()
+                self.finish()
+                retried = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+                self.assertEqual(retried[0]['status'], '成功')
+                self.assertNotEqual(retried[0]['output'], str(historical))
+
+    def test_invalid_cache_from_gui_is_task_error_preserves_records_and_can_recover(self):
+        source = self.inputs / 'a.psd'
+        source.write_bytes(tiny())
+        self.app.start_button.invoke()
+        self.finish()
+        report = Path(self.app.report_path.get())
+        original_report = report.read_bytes()
+        historical = Path(json.loads(original_report)[0]['output'])
+        original_output = historical.read_bytes()
+        manifest = self.output / '.cleaner-cache.json'
+        valid = manifest.read_text(encoding='utf-8')
+        records = json.loads(valid)
+        key = str(source.resolve())
+        outside = self.base / 'outside.psd'
+        outside.write_bytes(b'private external data')
+        escaped = {key: {**records[key], 'output': str(outside.resolve())}}
+        damaged_cases = ['not JSON', json.dumps({key: None}), json.dumps(escaped),
+                         json.dumps({key: {**records[key], 'source_hash': 'broken'}})]
+        path_open = Path.open
+
+        def guarded_open(path, mode='r', *args, **kwargs):
+            if path.resolve() == outside.resolve():
+                self.fail('GUI job attempted to read an out-of-bounds history file')
+            return path_open(path, mode, *args, **kwargs)
+
+        for damaged in damaged_cases:
+            with self.subTest(damaged=damaged):
+                manifest.write_text(damaged, encoding='utf-8')
+                with patch('pathlib.Path.open', new=guarded_open):
+                    self.app.start_button.invoke()
+                    self.finish()
+                self.assertEqual(self.app.phase.get(), '任务异常')
+                self.assertIn('增量记录', self.app.activity.get('1.0', 'end'))
+                self.assertEqual(len(self.app.results.get_children()), 0)
+                self.assertEqual(manifest.read_text(encoding='utf-8'), damaged)
+                self.assertEqual(report.read_bytes(), original_report)
+                self.assertEqual(historical.read_bytes(), original_output)
+                self.assertFalse((self.output / '.cleaner.lock').exists())
+        manifest.write_text(valid, encoding='utf-8')
+        self.app.start_button.invoke()
+        self.finish()
+        recovered = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual(recovered[0]['status'], '未变化')
+        self.assertEqual(recovered[0]['output'], str(historical))
+        self.assertEqual(outside.read_bytes(), b'private external data')
+
+    def test_worker_gc_after_prior_window_fixtures_keeps_batch_responsive(self):
+        source = self.inputs / 'a.psd'
+        original = tiny()
+        source.write_bytes(original)
+        collected = threading.Event()
+        unraisable: list[object] = []
+        path_open = Path.open
+
+        def collect_on_read(path, mode='r', *args, **kwargs):
+            if mode == 'rb' and path == source.resolve() and not collected.is_set():
+                collected.set()
+                gc.collect()
+            return path_open(path, mode, *args, **kwargs)
+
+        with patch('pathlib.Path.open', new=collect_on_read), patch('sys.unraisablehook', new=unraisable.append):
+            self.app.start_button.invoke()
+            self.finish()
+        self.assertTrue(collected.is_set())
+        self.assertEqual(unraisable, [])
+        self.assertEqual(self.app.phase.get(), '处理完成')
+        rows = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual(rows[0]['status'], '成功')
+        self.assertTrue(Path(rows[0]['output']).is_file())
+        self.assertEqual(source.read_bytes(), original)
 
     def test_stop_waits_for_current_write_or_validation_and_can_restart(self):
         original = tiny()
