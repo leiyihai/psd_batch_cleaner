@@ -1,5 +1,6 @@
 """Real Tk widgets -> shared batch -> filesystem; no mocked cleaning logic."""
 from contextlib import nullcontext
+import errno
 import gc
 import io
 import json
@@ -55,6 +56,243 @@ class GuiTests(unittest.TestCase):
             self.root.update()
             time.sleep(.01)
         self.assertTrue(event.is_set(), 'filesystem gate was not entered')
+
+    def test_result_details_and_classified_statistics_use_real_batch_records(self):
+        historical_source = self.inputs / 'c-历史.psd'
+        historical_source.write_bytes(tiny())
+        self.app.start_button.invoke()
+        self.finish()
+        first = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))[0]
+        fixtures = {'a-清理.psd': tiny(), 'b-原样.psb': tiny(2, xmp=None),
+                    'd-部分.psd': tiny(children=[embedded(b'%PDF opaque')]), 'e-损坏.psd': b'broken'}
+        for name, content in fixtures.items():
+            (self.inputs / name).write_bytes(content)
+        self.app.start_button.invoke()
+        self.finish()
+        rows = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual([row['status'] for row in rows], ['成功', '无需清理', '未变化', '部分清理', '失败'])
+        self.assertEqual(rows[2]['output'], first['output'])
+        statistics = self.app.statistics.get()
+        for text in ('成功 1', '无需清理 1', '未变化 1', '部分清理 1', '失败 1', '本轮可核实净减少',
+                     '历史复用、失败、未发布', '部分清理不等于完整成功'):
+            self.assertIn(text, statistics)
+        for item, row in zip(self.app.results.get_children(), rows):
+            self.app.results.selection_set(item)
+            self.root.update()
+            details = self.app.details.get('1.0', 'end')
+            self.assertIn(row['source'], details)
+            self.assertIn(row['output'] or '未发布（无可用输出）', details)
+            self.assertIn(f"原始大小：{row['before']} 字节", details)
+            if row['status'] == '失败':
+                self.assertIn('结果大小：未知', details)
+                self.assertIn(row['error'], details)
+            elif row['status'] == '未变化':
+                self.assertIn('复用历史副本', details)
+                self.assertIn('不计入本轮收益', details)
+            else:
+                self.assertIn(f"结果大小：{row['after']} 字节", details)
+                self.assertIn(f"清理文档数量：{row['documents']}", details)
+                self.assertIn(f"跳过外链数量：{row['skipped_links']}", details)
+            if row['status'] == '部分清理':
+                self.assertIn('不等于完整清理成功', details)
+                for index, issue in enumerate(row['issues'], 1):
+                    self.assertIn(f'{index}. {issue}', details)
+
+    def test_json_export_matches_the_same_batch_rows_and_classified_statistics(self):
+        self.assertTrue(self.app.export_button.instate(['disabled']))
+        fixtures = {'a.psd': tiny(), 'b.psb': tiny(2, xmp=None),
+                    'c.psd': tiny(children=[embedded(b'%PDF opaque')]), 'd.psd': b'broken'}
+        for name, content in fixtures.items():
+            (self.inputs / name).write_bytes(content)
+        self.app.start_button.invoke()
+        self.assertTrue(self.app.export_button.instate(['disabled']))
+        self.finish()
+        report = Path(self.app.report_path.get())
+        rows = json.loads(report.read_text(encoding='utf-8'))
+        phase, statistics = self.app.phase.get(), self.app.statistics.get()
+        destination = self.base / '中文 导出.json'
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(destination)):
+            self.app.export_button.invoke()
+            self.assertTrue(self.app.start_button.instate(['disabled']))
+            self.finish()
+        exported = json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(exported['results'], rows)
+        self.assertEqual(exported['task']['state'], 'finished')
+        self.assertEqual(exported['task']['source_report'], str(report))
+        self.assertEqual((exported['task']['completed'], exported['task']['total']), (4, 4))
+        self.assertEqual(exported['summary']['counts'], {'成功': 1, '无需清理': 1, '未变化': 0, '部分清理': 1, '失败': 1})
+        expected = sum(len(fixtures[Path(row['source']).name]) - Path(row['output']).stat().st_size
+                       for row in rows if row['status'] in ('成功', '无需清理', '部分清理'))
+        self.assertEqual(exported['summary']['savings_bytes'], expected)
+        self.assertIn('已导出', self.app.export_status.get())
+        self.assertEqual(self.app.phase.get(), phase)
+        self.assertEqual(self.app.statistics.get(), statistics)
+        self.assertFalse(self.app.export_button.instate(['disabled']))
+        self.assertEqual(json.loads(report.read_text(encoding='utf-8')), rows)
+        self.app.start_button.invoke()
+        self.finish()
+        reused_rows = json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))
+        self.assertEqual([row['status'] for row in reused_rows], ['未变化', '未变化', '部分清理', '失败'])
+        reused_export = self.base / '含历史复用.json'
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(reused_export)):
+            self.app.export_button.invoke()
+            self.finish()
+        reused_payload = json.loads(reused_export.read_text(encoding='utf-8'))
+        self.assertEqual(reused_payload['results'], reused_rows)
+        self.assertEqual(reused_payload['summary']['counted_files'], 1)
+        self.assertEqual(reused_payload['summary']['savings_bytes'],
+                         reused_rows[2]['before'] - reused_rows[2]['after'])
+
+    def test_export_cancel_overwrite_io_and_thread_errors_preserve_batch_and_allow_retry(self):
+        (self.inputs / 'a.psd').write_bytes(tiny())
+        self.app.start_button.invoke()
+        self.finish()
+        report = Path(self.app.report_path.get())
+        original_report = report.read_bytes()
+        phase, statistics = self.app.phase.get(), self.app.statistics.get()
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=''):
+            self.app.export_button.invoke()
+        self.assertFalse(self.app.start_button.instate(['disabled']))
+        occupied = self.base / '已有用户文件.json'
+        occupied.write_bytes(b'user data')
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(occupied)):
+            self.app.export_button.invoke()
+            self.finish()
+        self.assertIn('拒绝覆盖', self.app.export_status.get())
+        self.assertEqual(occupied.read_bytes(), b'user data')
+        failed = self.base / '失败导出.json'
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(failed)), \
+                patch('os.fsync', side_effect=OSError(errno.ENOSPC, '导出磁盘已满')):
+            self.app.export_button.invoke()
+            self.finish()
+        self.assertIn('导出磁盘已满', self.app.export_status.get())
+        self.assertFalse(failed.exists())
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(failed)), \
+                patch('threading.Thread.start', side_effect=RuntimeError('无法启动导出线程')):
+            self.app.export_button.invoke()
+            self.finish()
+        self.assertIn('无法启动导出线程', self.app.export_status.get())
+        self.assertFalse(failed.exists())
+        with patch('tkinter.filedialog.asksaveasfilename', side_effect=RuntimeError('保存对话框不可用')):
+            self.app.export_button.invoke()
+        self.assertIn('保存对话框不可用', self.app.export_status.get())
+        self.assertFalse(self.app.export_button.instate(['disabled']))
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(failed)):
+            self.app.export_button.invoke()
+            self.finish()
+        self.assertEqual(json.loads(failed.read_text(encoding='utf-8'))['results'], json.loads(original_report))
+        self.assertEqual(report.read_bytes(), original_report)
+        self.assertEqual(self.app.phase.get(), phase)
+        self.assertEqual(self.app.statistics.get(), statistics)
+
+    def test_export_runs_off_tk_thread_locks_snapshot_and_does_not_start_another_batch(self):
+        (self.inputs / 'a.psd').write_bytes(tiny())
+        self.app.start_button.invoke()
+        self.finish()
+        report = Path(self.app.report_path.get())
+        rows = json.loads(report.read_text(encoding='utf-8'))
+        destination = self.base / '异步导出.json'
+        entered, release = threading.Event(), threading.Event()
+        path_open = Path.open
+        ticks = []
+
+        def gated_export(path, mode='r', *args, **kwargs):
+            stream = path_open(path, mode, *args, **kwargs)
+            if path == destination and mode == 'x':
+                write = stream.write
+
+                def delayed_write(content):
+                    entered.set()
+                    if not release.wait(10):
+                        raise TimeoutError('export filesystem gate timed out')
+                    return write(content)
+
+                stream.write = delayed_write
+            return stream
+
+        self.app.output_path.set(str(self.base / 'not-the-job-output'))
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(destination)), \
+                patch('pathlib.Path.open', new=gated_export):
+            self.app.export_button.invoke()
+            try:
+                self.wait_for(entered)
+                self.root.after(1, lambda: ticks.append('responsive'))
+                self.root.update()
+                time.sleep(.01)
+                self.root.update()
+                self.assertTrue(ticks)
+                self.assertTrue(self.app.export_button.instate(['disabled']))
+                self.assertTrue(self.app.start_button.instate(['disabled']))
+                self.assertTrue(self.app.input_entry.instate(['disabled']))
+                self.assertTrue(self.app.stop_button.instate(['disabled']))
+                self.app.start()  # Programmatic start must also respect export ownership.
+                self.app.request_close()
+                self.assertTrue(self.root.winfo_exists())
+                self.assertEqual(len(list(self.output.glob('*/report.json'))), 1)
+            finally:
+                release.set()
+                self.finish()
+        exported = json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(exported['results'], rows)
+        self.assertEqual(exported['task']['output'], str(self.output))
+        self.assertEqual(exported['task']['source_report'], str(report))
+        self.assertFalse((self.base / 'not-the-job-output').exists())
+
+    def test_task_report_failure_export_preserves_observed_rows_and_task_error_context(self):
+        for name in ('a.psd', 'b.psd', 'c.psd'):
+            (self.inputs / name).write_bytes(tiny())
+        with fail_report_update_at(2):
+            self.app.start_button.invoke()
+            self.finish()
+        self.assertEqual(self.app.phase.get(), '任务异常')
+        report = Path(self.app.report_path.get())
+        self.assertEqual(len(json.loads(report.read_text(encoding='utf-8'))), 1)
+        destination = self.base / '任务异常记录.json'
+        with patch('tkinter.filedialog.asksaveasfilename', return_value=str(destination)):
+            self.app.export_button.invoke()
+            self.finish()
+        exported = json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(exported['task']['state'], 'error')
+        self.assertEqual((exported['task']['completed'], exported['task']['total']), (2, 3))
+        self.assertIn('结果报告写入失败', exported['task']['message'])
+        self.assertEqual(len(exported['results']), 2)
+        self.assertEqual(exported['summary']['counted_files'], 2)
+        self.assertEqual(exported['task']['source_report'], str(report))
+        self.assertTrue(all(Path(row['output']).is_file() for row in exported['results']))
+        self.assertEqual(self.app.phase.get(), '任务异常')
+
+    def test_empty_and_setup_error_exports_do_not_claim_files_completed(self):
+        self.app.start_button.invoke()
+        self.finish()
+        for expected_state in ('finished', 'error'):
+            if expected_state == 'error':
+                self.app.input_path.set(str(self.base / 'missing'))
+                self.app.start_button.invoke()
+                self.finish()
+            destination = self.base / f'{expected_state}.json'
+            with patch('tkinter.filedialog.asksaveasfilename', return_value=str(destination)):
+                self.app.export_button.invoke()
+                self.finish()
+            exported = json.loads(destination.read_text(encoding='utf-8'))
+            self.assertEqual(exported['task']['state'], expected_state)
+            self.assertEqual(exported['task']['completed'], 0)
+            self.assertEqual(exported['results'], [])
+            self.assertEqual(exported['summary']['counted_files'], 0)
+            self.assertEqual(exported['summary']['savings_bytes'], 0)
+            if expected_state == 'error':
+                self.assertIsNone(exported['task']['total'])
+                self.assertEqual(exported['task']['source_report'], '')
+                self.assertIn('输入目录不存在', exported['task']['message'])
+
+    def test_statistics_wrap_to_the_real_window_width(self):
+        self.root.geometry('800x800')
+        self.root.deiconify()
+        self.app.start_button.invoke()
+        self.finish()
+        self.root.update()
+        self.assertLessEqual(int(self.app.statistics_label.cget('wraplength')), self.app.winfo_width() - 48)
+        self.assertGreater(self.app.statistics_label.winfo_height(), 40)
+        self.assertIn('负数表示体积增加', self.app.statistics.get())
 
     def test_incremental_second_run_explains_full_hashing_and_historical_outputs(self):
         originals = {'a.PSD': tiny(), 'b.PSB': tiny(2, xmp=None)}

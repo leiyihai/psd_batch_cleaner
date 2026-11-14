@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from pathlib import Path
 import queue
 import threading
@@ -11,6 +12,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
 from prototype.batch import BatchEvent, run
+from prototype.results import describe_result, describe_summary, export_report, summarize
 
 
 INCREMENTAL_NOTE = '检查变化需完整读盘计算源文件及历史副本的 SHA-256；未变化不等于零耗时。'
@@ -26,12 +28,18 @@ class CleanerWindow(ttk.Frame):
         self.current_file = tk.StringVar(master, '尚未开始')
         self.report_path = tk.StringVar(master)
         self.summary = tk.StringVar(master, INCREMENTAL_NOTE)
+        self.statistics = tk.StringVar(master, '任务结束后显示分类数量与可核实收益；运行中可查看逐文件结果。')
+        self.export_status = tk.StringVar(master)
         self._messages: queue.Queue[BatchEvent] = queue.Queue()
         self._running = False
+        self._exporting = False
+        self._has_result = False
+        self._task_context: dict[str, Any] = {}
         self._stop = threading.Event()
         self._rows: dict[str, dict[str, Any]] = {}
         self._poll_id: str | None = None
         self._build()
+        self.bind('<Configure>', self._wrap_text)
         self._poll_id = self.after(40, self._poll)
 
     def _build(self) -> None:
@@ -61,8 +69,13 @@ class CleanerWindow(ttk.Frame):
         self.progress = ttk.Progressbar(bar, mode='indeterminate', length=180)
         self.progress.pack(side='right')
         ttk.Entry(self, textvariable=self.current_file, state='readonly').grid(row=5, column=0, columnspan=3, sticky='ew', pady=4)
-        ttk.Label(self, textvariable=self.summary, wraplength=900).grid(row=6, column=0, columnspan=3, sticky='ew', pady=6)
-        ttk.Label(self, text='结果（选择文件查看完整路径与错误）').grid(row=7, column=0, columnspan=3, sticky='w', pady=(8, 4))
+        self.summary_label = ttk.Label(self, textvariable=self.summary, wraplength=900)
+        self.summary_label.grid(row=6, column=0, columnspan=3, sticky='ew', pady=6)
+        heading = ttk.Frame(self)
+        heading.grid(row=7, column=0, columnspan=3, sticky='ew', pady=(8, 4))
+        ttk.Label(heading, text='结果（选择文件查看大小、完整路径与未处理明细）').pack(side='left')
+        self.export_button = ttk.Button(heading, text='导出 JSON…', command=self.export_results, state='disabled')
+        self.export_button.pack(side='right')
         table = ttk.Frame(self)
         table.grid(row=8, column=0, columnspan=3, sticky='nsew')
         table.rowconfigure(0, weight=1)
@@ -78,11 +91,21 @@ class CleanerWindow(ttk.Frame):
         horizontal.grid(row=1, column=0, sticky='ew')
         self.results.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         self.results.bind('<<TreeviewSelect>>', self._show_details)
-        self.details = ScrolledText(self, height=4, wrap='word', state='disabled', font=('Microsoft YaHei UI', 10), relief='flat')
+        self.details = ScrolledText(self, height=5, wrap='word', state='disabled', font=('Microsoft YaHei UI', 10), relief='flat')
         self.details.grid(row=9, column=0, columnspan=3, sticky='ew', pady=(8, 4))
-        self.activity = ScrolledText(self, height=4, wrap='word', state='disabled', font=('Microsoft YaHei UI', 10), relief='flat')
+        self.activity = ScrolledText(self, height=2, wrap='word', state='disabled', font=('Microsoft YaHei UI', 10), relief='flat')
         self.activity.grid(row=10, column=0, columnspan=3, sticky='ew', pady=4)
         ttk.Entry(self, textvariable=self.report_path, state='readonly').grid(row=11, column=0, columnspan=3, sticky='ew', pady=(4, 0))
+        self.statistics_label = ttk.Label(self, textvariable=self.statistics, wraplength=900)
+        self.statistics_label.grid(row=12, column=0, columnspan=3, sticky='ew', pady=6)
+        self.export_label = ttk.Label(self, textvariable=self.export_status, wraplength=900)
+        self.export_label.grid(row=13, column=0, columnspan=3, sticky='ew')
+
+    def _wrap_text(self, event: tk.Event) -> None:
+        width = max(200, event.width - 48)
+        for label in (self.summary_label, self.statistics_label, self.export_label):
+            if int(label.cget('wraplength')) != width:
+                label.configure(wraplength=width)
 
     def _browse(self, variable: tk.StringVar, input_directory: bool) -> None:
         if self._running:
@@ -97,12 +120,17 @@ class CleanerWindow(ttk.Frame):
         self.activity.see('end')
         self.activity.configure(state='disabled')
 
-    def _set_busy(self, busy: bool) -> None:
-        self._running = busy
+    def _refresh_controls(self) -> None:
+        locked = self._running or self._exporting
         for widget in (self.input_entry, self.output_entry, self.input_browse, self.output_browse,
                        self.start_button, self.recursive_check):
-            widget.state(['disabled'] if busy else ['!disabled'])
-        self.stop_button.state(['!disabled'] if busy else ['disabled'])
+            widget.state(['disabled'] if locked else ['!disabled'])
+        self.stop_button.state(['!disabled'] if self._running and not self._stop.is_set() else ['disabled'])
+        self.export_button.state(['!disabled'] if self._has_result and not locked else ['disabled'])
+
+    def _set_busy(self, busy: bool) -> None:
+        self._running = busy
+        self._refresh_controls()
         if busy:
             self.progress.configure(mode='indeterminate', value=0)
             self.progress.start(15)
@@ -110,7 +138,7 @@ class CleanerWindow(ttk.Frame):
             self.progress.stop()
 
     def start(self) -> None:
-        if self._running:
+        if self._running or self._exporting:
             return
         source, output = self.input_path.get().strip(), self.output_path.get().strip()
         recursive = self.recursive.get()
@@ -125,6 +153,11 @@ class CleanerWindow(ttk.Frame):
             area.delete('1.0', 'end')
             area.configure(state='disabled')
         self.report_path.set('')
+        self.export_status.set('')
+        self._has_result = False
+        self._task_context = {'state': 'running', 'input': source, 'output': output, 'recursive': recursive,
+                              'completed': 0, 'total': None, 'source_report': '', 'message': ''}
+        self.statistics.set('任务结束后显示分类数量与可核实收益；运行中可查看逐文件结果。')
         self.current_file.set('准备检查目录…')
         self.summary.set(INCREMENTAL_NOTE + ' 当前任务参数已锁定。')
         self._log(INCREMENTAL_NOTE)
@@ -164,6 +197,36 @@ class CleanerWindow(ttk.Frame):
             if not error_sent:
                 self._messages.put(BatchEvent('error', message=str(exc)))
 
+    def export_results(self) -> None:
+        if self._running or self._exporting or not self._has_result:
+            return
+        try:
+            selected = filedialog.asksaveasfilename(parent=self.winfo_toplevel(), title='导出本轮结果（不覆盖已有文件）',
+                                                   defaultextension='.json', filetypes=[('JSON 结果报告', '*.json')],
+                                                   confirmoverwrite=False)
+        except Exception as exc:
+            self.export_status.set(f'导出失败：{exc}')
+            self._log(self.export_status.get())
+            return
+        if not selected:
+            return
+        rows, task = deepcopy(list(self._rows.values())), dict(self._task_context)
+        self._exporting = True
+        self.export_status.set('正在导出本轮已接收的结果；报告不代表未处理文件已完成。')
+        self._refresh_controls()
+        try:
+            threading.Thread(target=self._write_export, args=(Path(selected), rows, task), daemon=False).start()
+        except Exception as exc:
+            self._messages.put(BatchEvent('export_error', message=str(exc)))
+
+    def _write_export(self, destination: Path, rows: list[dict[str, Any]], task: dict[str, Any]) -> None:
+        try:
+            export_report(destination, rows, task=task)
+        except Exception as exc:
+            self._messages.put(BatchEvent('export_error', message=str(exc)))
+        else:
+            self._messages.put(BatchEvent('exported', report=destination))
+
     def _poll(self) -> None:
         try:
             # Bound each drain so bursts of tiny files cannot monopolize Tk.
@@ -174,13 +237,24 @@ class CleanerWindow(ttk.Frame):
         self._poll_id = self.after(40, self._poll)
 
     def _handle(self, event: BatchEvent) -> None:
-        if event.kind == 'phase':
+        if event.kind in ('finished', 'stopped', 'error'):
+            self.statistics.set(describe_summary(summarize(self._rows.values())))
+            self._has_result = True
+            self._task_context.update(state=event.kind, completed=len(self._rows), message=event.message,
+                                      source_report=str(event.report or self.report_path.get()))
+        if event.kind in ('exported', 'export_error'):
+            self._exporting = False
+            self.export_status.set(f'已导出：{event.report}' if event.kind == 'exported' else f'导出失败：{event.message}')
+            self._refresh_controls()
+            self._log(self.export_status.get())
+        elif event.kind == 'phase':
             if not self._stop.is_set():
                 self.phase.set(event.phase)
             if event.source is not None:
                 self.current_file.set(str(event.source))
             self._log(event.phase + (f'：{event.source}' if event.source else ''))
         elif event.kind == 'scanned':
+            self._task_context['total'] = event.total
             self.progress.stop()
             self.progress.configure(mode='determinate', maximum=max(event.total or 0, 1), value=0)
             self.summary.set(f'扫描完成：0 / {event.total} 个文件。')
@@ -222,22 +296,15 @@ class CleanerWindow(ttk.Frame):
         if not selection or selection[0] not in self._rows:
             return
         row = self._rows[selection[0]]
-        text = f"状态：{row['status']}"
-        if row['status'] == '未变化':
-            text += '\n复用历史副本：源内容、规则和输出校验一致；本轮未重复清理或复制。'
-        if row.get('error'):
-            text += '\n错误：' + row['error']
-        text += f"\n输入：{row['source']}\n输出：{row['output'] or '未发布'}"
-        if row.get('issues'):
-            text += '\n' + '\n'.join(row['issues'])
+        text = describe_result(row)
         self.details.configure(state='normal')
         self.details.delete('1.0', 'end')
         self.details.insert('1.0', text)
         self.details.configure(state='disabled')
 
     def request_close(self) -> None:
-        if self._running:
-            self._log('本轮仍在处理，请点击“安全停止”或等待本轮结束后再关闭窗口；不会中断正在写入的文件。')
+        if self._running or self._exporting:
+            self._log('本轮仍在处理或导出，请安全停止任务或等待导出结束后再关闭窗口；不会中断正在写入的文件。')
             return
         self.winfo_toplevel().destroy()
 
@@ -251,8 +318,9 @@ def create_window() -> tuple[tk.Tk, CleanerWindow]:
     """Build the same application window for the entry point and UI acceptance."""
     root = tk.Tk()
     root.title('PSD Batch Cleaner · PSD 批量瘦身')
-    root.geometry('1060x760')
-    root.minsize(780, 650)
+    height = max(640, min(900, root.winfo_screenheight() - 100))
+    root.geometry(f'1060x{height}')
+    root.minsize(780, min(760, height))
     style = ttk.Style(root)
     style.theme_use('clam')
     style.configure('.', font=('Microsoft YaHei UI', 10))

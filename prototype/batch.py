@@ -172,13 +172,16 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
         for source in sources:
             if stop.is_set():
                 break
-            row: dict[str, Any] = {"source": str(source), "status": "失败", "output": None}
+            row: dict[str, Any] = {"source": str(source), "status": "失败", "output": None,
+                                   "published": False, "before": None, "after": None}
             started = time.perf_counter()
             infrastructure_error: RuntimeError | None = None
             accessing_output = False
             try:
                 announce_phase('检查变化', source)
                 digest = sha256_file(source)
+                before = source.stat().st_size
+                row['before'] = before
                 key = str(source)
                 previous = cache.get(key, {})
                 accessing_output = True
@@ -191,7 +194,8 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                     try:
                         # is_file() suppresses OS errors; only missing outputs
                         # are a cache miss, not an unreadable output volume.
-                        cached = (stat.S_ISREG(prior_path.stat().st_mode)
+                        prior_stat = prior_path.stat()
+                        cached = (stat.S_ISREG(prior_stat.st_mode)
                                   and sha256_file(prior_path) == previous.get("output_hash"))
                     except FileNotFoundError:
                         cached = False
@@ -199,10 +203,9 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 if cached:
                     if sha256_file(source) != digest:
                         raise ValueError("输入在验证历史输出期间发生变化，稍后重试")
-                    row.update(status="未变化", output=str(prior_path))
+                    row.update(status="未变化", output=str(prior_path), after=prior_stat.st_size)
                 else:
                     announce_phase('清理中', source)
-                    before = source.stat().st_size
                     accessing_output = True
                     with tempfile.TemporaryDirectory(dir=run_dir) as temporary:
                         staged = Path(temporary) / "result.tmp"
@@ -217,7 +220,7 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                             os.link(staged, destination)
                         except FileExistsError as exc:
                             raise ValueError(f'输出已存在，拒绝覆盖：{destination}') from exc
-                        row['output'] = str(destination)
+                        row.update(output=str(destination), published=True)
                         row.update(status=result.status, before=before,
                                    after=after, removed=result.removed,
                                    documents=result.documents, skipped_links=result.linked,
