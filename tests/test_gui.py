@@ -1,5 +1,7 @@
 """Real Tk widgets -> shared batch -> filesystem; no mocked cleaning logic."""
 import io
+import json
+import threading
 import os
 from unittest.mock import patch
 from pathlib import Path
@@ -8,6 +10,7 @@ import time
 import tkinter as tk
 import unittest
 from psd_tools.psd import PSD
+from prototype.batch import run
 from psd_tools.constants import Resource
 from test_prototype import tiny, embedded, XMP, TARGET_ELEMENT
 
@@ -39,6 +42,133 @@ class GuiTests(unittest.TestCase):
             time.sleep(.01)
         self.assertFalse(self.app.start_button.instate(['disabled']), 'GUI job did not finish')
         self.root.update()
+
+    def test_stop_waits_for_current_write_or_validation_and_can_restart(self):
+        original = tiny()
+        for name in ('a.psd', 'b.psd'):
+            (self.inputs / name).write_bytes(original)
+        self.assertTrue(self.app.stop_button.instate(['disabled']))
+        path_open = Path.open
+        for stage in ('write', 'validation'):
+            with self.subTest(stage=stage):
+                output = self.base / stage
+                self.app.output_path.set(str(output))
+                entered, release = threading.Event(), threading.Event()
+
+                def gated_open(path, mode='r', *args, **kwargs):
+                    if path.name == 'result.tmp' and mode == ('xb' if stage == 'write' else 'rb'):
+                        entered.set()
+                        if not release.wait(10):
+                            raise TimeoutError('test filesystem gate timed out')
+                    return path_open(path, mode, *args, **kwargs)
+
+                with patch('pathlib.Path.open', new=gated_open):
+                    self.app.start_button.invoke()
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not entered.is_set() and time.monotonic() < deadline:
+                            self.root.update()
+                            time.sleep(.01)
+                        self.assertTrue(entered.is_set())
+                        lock = output / '.cleaner.lock'
+                        owner = lock.read_bytes()
+                        with self.assertRaisesRegex(RuntimeError, '已有任务'):
+                            run(self.inputs, output, emit=lambda _: None)
+                        self.assertEqual(lock.read_bytes(), owner)
+                        self.app.stop_button.invoke()
+                        self.root.update()
+                        self.assertEqual(self.app.phase.get(), '请求停止')
+                        self.assertTrue(self.app.start_button.instate(['disabled']))
+                        self.assertTrue(self.app.stop_button.instate(['disabled']))
+                        self.assertEqual(len(self.app.results.get_children()), 0)
+                        self.app.request_close()
+                        self.assertTrue(self.root.winfo_exists())
+                    finally:
+                        release.set()
+                        self.finish()
+                self.assertEqual(self.app.phase.get(), '已停止')
+                self.assertIn('1 / 2', self.app.summary.get())
+                self.assertIn('未处理 1', self.app.summary.get())
+                report = Path(self.app.report_path.get())
+                rows = json.loads(report.read_text(encoding='utf-8'))
+                self.assertEqual([Path(r['source']).name for r in rows], ['a.psd'])
+                self.assertEqual(rows[0]['status'], '成功')
+                self.assertTrue(Path(rows[0]['output']).is_file())
+                self.assertFalse(list(output.glob('*/files/b.psd')))
+                self.assertFalse((output / '.cleaner.lock').exists())
+                self.app.start_button.invoke()
+                self.finish()
+                self.assertEqual(self.app.phase.get(), '处理完成')
+                self.assertEqual(len(self.app.results.get_children()), 2)
+                self.assertTrue(self.app.stop_button.instate(['disabled']))
+        for name in ('a.psd', 'b.psd'):
+            self.assertEqual((self.inputs / name).read_bytes(), original)
+
+    def test_report_failure_preserves_outputs_shows_task_error_and_can_restart(self):
+        for name in ('a.psd', 'b.psd', 'c.psd'):
+            (self.inputs / name).write_bytes(tiny())
+        replace = os.replace
+
+        def report_unavailable(source, destination):
+            if Path(destination).name == 'report.json':
+                rows = json.loads(Path(source).read_text(encoding='utf-8'))
+                if len(rows) == 2:
+                    raise PermissionError('报告目录不可写')
+            return replace(source, destination)
+
+        with patch('os.replace', side_effect=report_unavailable):
+            self.app.start_button.invoke()
+            self.finish()
+        self.assertEqual(self.app.phase.get(), '任务异常')
+        self.assertIn('结果报告写入失败', self.app.activity.get('1.0', 'end'))
+        self.assertEqual(len(self.app.results.get_children()), 2)
+        report = Path(self.app.report_path.get())
+        self.assertEqual(len(json.loads(report.read_text(encoding='utf-8'))), 1)
+        self.assertEqual(len(list(self.output.glob('*/files/*.psd'))), 2)
+        self.assertFalse(list(self.output.glob('*/files/c.psd')))
+        self.assertTrue(self.app.stop_button.instate(['disabled']))
+        self.assertFalse(self.app.input_entry.instate(['disabled']))
+        self.assertFalse((self.output / '.cleaner.lock').exists())
+        self.app.start_button.invoke()
+        self.finish()
+        self.assertEqual(self.app.phase.get(), '处理完成')
+        self.assertEqual(len(self.app.results.get_children()), 3)
+        self.assertEqual(len(json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8'))), 3)
+
+    def test_stop_during_scan_stays_requested_until_scan_safely_returns(self):
+        (self.inputs / 'a.psd').write_bytes(tiny())
+        entered, release = threading.Event(), threading.Event()
+        scandir = os.scandir
+
+        def gated_scan(path):
+            if Path(path) == self.inputs.resolve():
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError('test scan gate timed out')
+            return scandir(path)
+
+        with patch('os.scandir', side_effect=gated_scan):
+            self.app.start_button.invoke()
+            try:
+                deadline = time.monotonic() + 5
+                while not entered.is_set() and time.monotonic() < deadline:
+                    self.root.update()
+                    time.sleep(.01)
+                self.assertTrue(entered.is_set())
+                self.app.stop_button.invoke()
+                self.root.update()
+                self.assertEqual(self.app.phase.get(), '请求停止')
+                self.assertTrue(self.app.start_button.instate(['disabled']))
+            finally:
+                release.set()
+                self.finish()
+        self.assertEqual(self.app.phase.get(), '已停止')
+        self.assertIn('0 / 1', self.app.summary.get())
+        self.assertEqual(json.loads(Path(self.app.report_path.get()).read_text(encoding='utf-8')), [])
+        self.assertFalse(list(self.output.glob('*/files/*.psd')))
+        self.app.start_button.invoke()
+        self.finish()
+        self.assertEqual(self.app.phase.get(), '处理完成')
 
     def test_recursive_option_defaults_on_maps_nested_names_and_freezes_scope(self):
         (self.inputs / '子目录' / '多层 空格').mkdir(parents=True)

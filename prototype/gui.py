@@ -25,6 +25,7 @@ class CleanerWindow(ttk.Frame):
         self.summary = tk.StringVar(master, '默认包含子文件夹；瘦身副本保留输入相对路径。')
         self._messages: queue.Queue[BatchEvent] = queue.Queue()
         self._running = False
+        self._stop = threading.Event()
         self._rows: dict[str, dict[str, Any]] = {}
         self._poll_id: str | None = None
         self._build()
@@ -49,6 +50,8 @@ class CleanerWindow(ttk.Frame):
         bar.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(16, 8))
         self.start_button = ttk.Button(bar, text='开始瘦身', style='Accent.TButton', command=self.start)
         self.start_button.pack(side='left')
+        self.stop_button = ttk.Button(bar, text='安全停止', command=self.request_stop, state='disabled')
+        self.stop_button.pack(side='left', padx=(8, 0))
         self.recursive_check = ttk.Checkbutton(bar, text='包含子文件夹', variable=self.recursive)
         self.recursive_check.pack(side='left', padx=(12, 0))
         ttk.Label(bar, textvariable=self.phase).pack(side='left', padx=18, fill='x', expand=True)
@@ -96,6 +99,7 @@ class CleanerWindow(ttk.Frame):
         for widget in (self.input_entry, self.output_entry, self.input_browse, self.output_browse,
                        self.start_button, self.recursive_check):
             widget.state(['disabled'] if busy else ['!disabled'])
+        self.stop_button.state(['!disabled'] if busy else ['disabled'])
         if busy:
             self.progress.configure(mode='indeterminate', value=0)
             self.progress.start(15)
@@ -121,15 +125,24 @@ class CleanerWindow(ttk.Frame):
         self.current_file.set('准备检查目录…')
         self.summary.set('串行处理中；原稿不覆盖。当前任务参数已锁定。')
         self.phase.set('准备中')
+        self._stop = threading.Event()
         self._set_busy(True)
         # Capture strings now: even programmatic StringVar edits cannot alter
         # this job. The non-daemon worker is never killed halfway through writing.
         try:
-            threading.Thread(target=self._work, args=(source, output, recursive), daemon=False).start()
+            threading.Thread(target=self._work, args=(source, output, recursive, self._stop), daemon=False).start()
         except Exception as exc:
             self._messages.put(BatchEvent('error', message=str(exc)))
 
-    def _work(self, source: str, output: str, recursive: bool) -> None:
+    def request_stop(self) -> None:
+        if not self._running or self._stop.is_set():
+            return
+        self._stop.set()
+        self.stop_button.state(['disabled'])
+        self.phase.set('请求停止')
+        self._log('已请求停止：等待当前文件完成或安全失败；扫描中则等待扫描结束，不再启动下一文件。')
+
+    def _work(self, source: str, output: str, recursive: bool, stop: threading.Event) -> None:
         error_sent = False
 
         def receive(event: BatchEvent) -> None:
@@ -139,7 +152,7 @@ class CleanerWindow(ttk.Frame):
             self._messages.put(event)
 
         try:
-            run(Path(source).expanduser(), Path(output).expanduser(), recursive=recursive,
+            run(Path(source).expanduser(), Path(output).expanduser(), recursive=recursive, stop=stop,
                 emit=lambda message: None, on_event=receive)
         except Exception as exc:
             # Setup can fail before run emits anything; always deliver one
@@ -158,7 +171,8 @@ class CleanerWindow(ttk.Frame):
 
     def _handle(self, event: BatchEvent) -> None:
         if event.kind == 'phase':
-            self.phase.set(event.phase)
+            if not self._stop.is_set():
+                self.phase.set(event.phase)
             if event.source is not None:
                 self.current_file.set(str(event.source))
             self._log(event.phase + (f'：{event.source}' if event.source else ''))
@@ -183,12 +197,16 @@ class CleanerWindow(ttk.Frame):
             self.phase.set('任务异常')
             self.summary.set('任务无法继续；已完成的输出保留，请查看错误信息。')
             self._log('任务异常：' + event.message)
-        elif event.kind == 'finished':
+        elif event.kind in ('finished', 'stopped'):
             self._set_busy(False)
             failed = sum(row['status'] == '失败' for row in self._rows.values())
             partial = sum(row['status'] == '部分清理' for row in self._rows.values())
-            self.phase.set('处理结束（存在失败）' if failed else '处理结束（存在部分清理）' if partial else '处理完成')
-            self.summary.set(f'本轮 {event.completed} / {event.total} 个文件，失败 {failed} 个，部分清理 {partial} 个。' if self._rows else '本轮扫描范围内没有可处理的 PSD / PSB 文件（0 / 0）。')
+            if event.kind == 'stopped':
+                self.phase.set('已停止')
+                self.summary.set(f'已停止：处理 {event.completed} / {event.total} 个文件，未处理 {(event.total or 0) - event.completed} 个；失败 {failed} 个，部分清理 {partial} 个。')
+            else:
+                self.phase.set('处理结束（存在失败）' if failed else '处理结束（存在部分清理）' if partial else '处理完成')
+                self.summary.set(f'本轮 {event.completed} / {event.total} 个文件，失败 {failed} 个，部分清理 {partial} 个。' if self._rows else '本轮扫描范围内没有可处理的 PSD / PSB 文件（0 / 0）。')
             self.report_path.set(str(event.report or ''))
             self._log(self.phase.get() + '；' + self.summary.get())
 
@@ -210,7 +228,7 @@ class CleanerWindow(ttk.Frame):
 
     def request_close(self) -> None:
         if self._running:
-            self._log('本轮仍在处理，请等待安全完成后再关闭窗口；停止操作将在后续工单提供。')
+            self._log('本轮仍在处理，请点击“安全停止”或等待本轮结束后再关闭窗口；不会中断正在写入的文件。')
             return
         self.winfo_toplevel().destroy()
 

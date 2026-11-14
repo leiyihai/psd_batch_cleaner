@@ -84,12 +84,12 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
     notify = on_event if on_event is not None else lambda event: None
     try:
         notify(BatchEvent('phase', phase='扫描文件'))
-        rows, report, total = _run(input_dir, output_dir, stop=stop, emit=emit,
+        rows, report, total, stopped = _run(input_dir, output_dir, stop=stop, emit=emit,
                             selected_files=selected_files, recursive=recursive, notify=notify)
     except Exception as exc:
         notify(BatchEvent('error', message=str(exc)))
         raise
-    notify(BatchEvent('finished', report=report, total=total, completed=len(rows)))
+    notify(BatchEvent('stopped' if stopped else 'finished', report=report, total=total, completed=len(rows)))
     return rows, report
 
 
@@ -111,9 +111,13 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
     stop = stop or threading.Event()
     lock = output / ".cleaner.lock"
     # Refuse overlapping jobs that could race on the cache or the same source tree.
-    with lock.open("x", encoding="utf-8") as stream:
-        stream.write(str(os.getpid()))
     try:
+        stream = lock.open('x', encoding='utf-8')
+    except FileExistsError as exc:
+        raise RuntimeError(f'输出目录已有任务或遗留锁：{lock}。请先确认该目录无任务运行；仅确认后才可手动移除遗留锁，勿强制解锁。') from exc
+    try:
+        with stream:
+            stream.write(str(os.getpid()))
         manifest = output / ".cleaner-cache.json"
         cache = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
         if not isinstance(cache, dict):
@@ -136,6 +140,7 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
             row: dict[str, Any] = {"source": str(source), "status": "失败", "output": None}
             started = time.perf_counter()
             infrastructure_error: RuntimeError | None = None
+            writing_output = False
             try:
                 announce_phase('检查变化', source)
                 digest = sha256_file(source)
@@ -153,6 +158,7 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 else:
                     announce_phase('清理中', source)
                     before = source.stat().st_size
+                    writing_output = True
                     with tempfile.TemporaryDirectory(dir=run_dir) as temporary:
                         staged = Path(temporary) / "result.tmp"
                         result = clean_file(source, staged, on_validate=lambda: announce_phase('校验中', source))
@@ -161,7 +167,10 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                             raise ValueError("输入在清理期间发生变化，取消发布")
                         destination = run_dir / "files" / source.relative_to(root)
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        os.link(staged, destination)
+                        try:
+                            os.link(staged, destination)
+                        except FileExistsError as exc:
+                            raise ValueError(f'输出已存在，拒绝覆盖：{destination}') from exc
                         row.update(status=result.status, output=str(destination), before=before,
                                    after=staged.stat().st_size, removed=result.removed,
                                    documents=result.documents, skipped_links=result.linked,
@@ -177,19 +186,27 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                             infrastructure_error = RuntimeError(f"输出已发布，但增量记录写入失败，任务终止：{exc}")
                             raise infrastructure_error from exc
             except Exception as exc:
+                # psd-tools also raises OSError without errno for malformed
+                # content. Only actual OS I/O errors here indicate a potentially
+                # unavailable output volume; parser rejections remain per-file.
+                if writing_output and isinstance(exc, OSError) and exc.errno is not None:
+                    infrastructure_error = RuntimeError(f'输出读写或发布失败，任务终止：{exc}')
                 row["status"] = "失败"
-                row["error"] = str(exc)
+                row["error"] = str(infrastructure_error or exc)
             row["elapsed_seconds"] = round(time.perf_counter() - started, 6)
             rows.append(row)
-            atomic_json(report, rows)
-            notify(BatchEvent('file', source=source, row=dict(row), report=report,
+            try:
+                atomic_json(report, rows)
+            except Exception as exc:
+                infrastructure_error = RuntimeError(f'结果报告写入失败，任务终止；已完成输出和此前报告保留：{exc}')
+            notify(BatchEvent('file', source=source, row=dict(row), report=report if report.is_file() else None,
                               total=total, completed=len(rows)))
             emit(f"{row['status']}：{source}" + (f"；{row['error']}" if "error" in row else ""))
             if infrastructure_error is not None:
                 raise infrastructure_error
         # Even an empty input or a cancelled run has a report.
         atomic_json(report, rows)
-        return rows, report, total
+        return rows, report, total, stop.is_set()
     finally:
         lock.unlink(missing_ok=True)
 
