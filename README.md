@@ -1,91 +1,70 @@
-# 清理PSD文件脚本
+# PSD Batch Cleaner · PSD 批量瘦身工具
 
-## 原作者信息
-原项目地址：https://github.com/julysohu/photoshop_deep_cleaner
+基于 Python 和 `psd-tools` 的 PSD/PSB 深度清理项目：删除主文档及受支持嵌入式智能对象中的 Photoshop XMP `DocumentAncestors`（文档祖先元数据），生成独立瘦身副本。**正常清理不需要启动或调用 Photoshop。**
 
-原项目作者：https://github.com/julysohu
+> **当前为开发阶段，不是已完成的桌面应用。** 工单 01、02 已完成约定验收，GUI 03–08 和并行模式尚未实现；这些验收不构成任意文件绝对无损或可直接无人值守生产运行的承诺。
 
-由于原项目已许久未维护，且项目中一些功能需要改进。
+## 当前能力与边界
 
-故fork了本仓库，并改名为Photoshop Deep Cleaner Plus。
+- 递归清理实际内容为 PSD/PSB 的嵌入式智能对象；不跟随外链源文件。
+- 只删除文档祖先元数据，不整体删除 XMP，不合并、栅格化图层或重新编码像素。
+- 输入、输出目录独立且不可相互包含，原稿不覆盖；新副本保留输入子目录结构。
+- 非 PSD/PSB 嵌入内容原样保留，明确标记“部分清理”；结构或校验失败时不发布修改结果。
+- 完整成功或无需清理的文件，在源内容、规则和输出校验均未变化时可增量复用；部分清理和失败不作为完整成功复用。
+- 大文件主路径使用文件区间补丁和未修改区间逐块校验，不全量重序列化文档。当前发布机制要求输出文件系统支持硬链接（如 NTFS）。
 
-## PSD文件过大的原因
+四份真实样本已完成约定的结构、渲染及编辑保存重开验收，含真实嵌套、共享实例和原生嵌入 PSD；其中三份 0.91–2.80 GB 文件已有自动保真与资源测量证据，峰值工作集约 162–200 MiB。未知数据样本已验证嵌入/独立文档保留图层、原始未知载荷逐字节保留及损坏拒绝后继续批次。详见 [01 最终验收](docs/ticket01-closeout.md)、[02 最终验收](docs/ticket02-closeout.md)。**Python 不通过丢弃未知内容消除 Photoshop 警告，清理稿在旧 Photoshop 中仍可能报警。**
 
-### 什么是原始数据？
-在PS的使用过程中，PS会将一些信息存储在文件的`原始数据（Metadata）`之中。
+## 快速开始（Windows）
 
-例如创建时间、修改时间、使用的软件版本等信息。
-
-通过 **文件 --> 文件简介 --> 原始数据**，可以查看到它的内容。
-
-但如果`原始数据`过多时，在这个界面也是无法直接查看内容的。
-
-### 谁向原始数据中添加了那么多内容？
-
-导致`原始数据`内容过多的原因是，PS会向`原始数据`中，存储一种叫做`文档祖先（DocumentAncestors）`的信息。
-
-很多操作都会让PS向其中添加记录内容（例如复制功能），从而导致PS文件逐渐变大。
-
-> 官方说明：
-> 
-> If the source document for a copy-and-paste or place operation has a document ID, that ID is added to this list in the destination document's XMP.
-> 
-> （如果复制粘贴或放置操作的源文档具有文档ID，则将该ID添加到目标文档的XMP中。）
-
-这种记录很难被用户直接察觉，且无法直接通过PS的功能清理。
-
-### 为什么需要处理智能对象？
-
-另外，PS中的`智能对象`实际上也是一种PS的文件。
-
-因此，它也会存储`文档祖先`信息。
-
-### 可以删除掉这些内容吗？
-
-在`文档祖先`中的数据，对于一般用户来说，几乎没有应用场景。
-
-所以，我们可以通过清理`文档祖先`的方式，来减小PSD文件的大小。
-
-## 脚本工作原理
-
-本脚本通过调用PS中脚本读写`原始数据`的功能，将`原始数据`中的`祖先对象`清空，从而达到清理PSD文件的目的。
-
-## 工具特点
-
-- 支持递归清理文档中的智能对象，清理更加彻底；
-- 修改为全中文提示，方便使用；
-- 显示清理前后的文件大小变化，方便用户查看清理效果；
-- 详尽的备注，方便开发者做扩展。
-
-## 使用说明
-
-1. 下载本项目的压缩包，解压到本地。
-2. 在Photoshop中打开psd文件，菜单栏选择 **文件 --> 脚本 --> 浏览**。
-3. 选择脚本文件：
-   - 选择 PsDeepCleanerPlus.jsx 文件针对当前文件进行处理；
-   - 选择 PsDeepCleanerPlusForFolder.jsx 对指定路径下所有指定格式的文件处理。
-4. 根据提示执行脚本。
-
-## Python 批处理验证原型（开发中）
-
-新增基于 `psd-tools` 的独立文件清理原型，正常清理无需启动 Photoshop。支持递归处理嵌入的 PSD/PSB，只删除 `DocumentAncestors`，保留外链及其他元数据；非 PSD 嵌入内容会标为部分清理。
-
-目前是 GUI 开发前的验证阶段。三份 0.91–2.80 GB 的真实设计稿已通过文件区间清理及自动保真检查，加入图层及合成图校验后的峰值工作集约 162–200 MiB；**完整 Photoshop 深层可编辑性验收仍未完成，不建议用于无人值守生产批处理**。
+在项目根目录执行（本机当前为 `E:\psd_batch_cleaner`）。以下命令不依赖该绝对位置；目录职责和历史迁移说明见 [项目布局](docs/project-layout.md)。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m prototype.batch --input "D:\测试输入" --output "D:\测试输出"
+.\.venv\Scripts\python.exe -m prototype.batch --input "D:\输入" --output "D:\独立输出"
 ```
 
-输入和输出目录必须独立、不得相互包含。原文件不覆盖；输出按每次运行的独立子目录保存，并保留输入子目录结构。完整成功且源内容、规则与输出副本均未变化时，后续运行通过 SHA-256 增量判断复用历史输出。
+默认扫描子文件夹，识别 PSD/PSB。每次运行创建独立输出子目录；增量命中返回历史输出引用，并不在本轮重复复制一套结果。请避免在处理期间修改输入文件。
 
-真实样本、与 JSX 参考的差异、复现命令和未完成验收见 [真实文件验收记录](docs/real-file-acceptance.md)，早期小样本验证见 [原型验证记录](docs/prototype-validation.md)。大文件批处理使用文件区间补丁，逐块验证未修改字节，不对整份文档重序列化。桌面 GUI 和并行模式尚未实现。
+首次使用请先备份素材并用少量副本验证。正常清理只需 `requirements.txt`；开发、资源测量及可选 Photoshop 验收使用 `requirements-dev.txt`。
 
-## 参考链接
+## 开发验证
 
-- https://marketplace.visualstudio.com/items?itemName=Adobe.extendscript-debug
-- https://extendscript.docsforadobe.dev/scripting-xmp/accessing-the-xmp-scripting-api.html
-- https://github.com/Adobe-CEP/CEP-Resources/tree/master/Documentation/Product%20specific%20Documentation/Photoshop%20Scripting
-- https://github.com/adobe/xmp-docs/blob/master/XMPNamespaces/photoshop.md
-- https://helpx.adobe.com/photoshop/using/scripting.html
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py
+```
+
+普通自动测试不调用 Photoshop。真实样本、资源测量和宿主验收的命令及安全要求见 [真实文件验收记录](docs/real-file-acceptance.md)。宿主验收必须显式执行，使用已有且无文档的空闲 Photoshop 会话；watchdog 退出不等于取消 Photoshop 脚本，超时后不得自动重试。
+
+## 项目导航
+
+| 路径 | 用途 |
+| --- | --- |
+| `prototype/` | Python 清理、批处理与验收模块；沿用现有模块名和 `python -m prototype.batch` 入口 |
+| `tests/` | 自动回归测试 |
+| `docs/` | 当前验收记录、历史验证、架构决策及协作配置 |
+| `GLOSSARY.md` | 领域术语 |
+| `.scratch/psd-batch-cleaner/` | 唯一完整规格及本地工单 |
+| `legacy/photoshop/` | 独立保留的旧 JSX 工具及参考资料，不是 Python 清理依赖 |
+| `.prototype-data/` | 被 Git 忽略的本地样本、验收证据和诊断工具 |
+| `测试psd比对/` | 被 Git 忽略的用户原始素材与 JSX 参考集 |
+
+- [目录布局与重命名说明](docs/project-layout.md)
+- [真实文件早期验收记录](docs/real-file-acceptance.md)：保留当时的失败与资源测量记录
+- [01 最终验收](docs/ticket01-closeout.md)、[02 最终验收](docs/ticket02-closeout.md)：当前完成结论与支持边界
+- [历史小样本验证](docs/prototype-validation.md)：早期记录，不代表当前批处理限制
+- [文件区间补丁 ADR](docs/adr/0001-stream-metadata-patches.md)
+- [规格与工单导航](docs/spec-psd-batch-cleaner.md)
+- [旧 JSX 使用说明](legacy/photoshop/README.md)
+
+## 项目来源
+
+本项目从 Photoshop Deep Cleaner Plus 的 JSX 工具演进而来，当前主方向为无需 Photoshop 的 Python 批量清理。
+
+- 原项目：<https://github.com/julysohu/photoshop_deep_cleaner>
+- 原作者：<https://github.com/julysohu>
+
+Git 历史、原有 JSX 脚本与参考资料均保留。JSX 上游来源为 [Photoshop Deep Cleaner Plus](https://github.com/MisakaCirno/photoshop_deep_cleaner_plus)；当前开发仓库为 [leiyihai/psd_batch_cleaner](https://github.com/leiyihai/psd_batch_cleaner)。本项目规格和工单在本地 Markdown 维护，不使用上游或开发仓库的 GitHub Issues 作为工单系统。

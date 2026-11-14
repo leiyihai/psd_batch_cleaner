@@ -8,6 +8,10 @@
 
 三份结果都含不处理的非 PSD/PSB 嵌入内容，按已确认规则标为“部分清理”。这不是报错或任务中断，也不等于对所有格式完成了深度清理。
 
+> 当前状态：工单01、02现已完成约定验收，分别见 [01最终记录](ticket01-closeout.md)、[02最终记录](ticket02-closeout.md)。本文保留早期阶段的测量、失败及当时未完成项，不代替最终完成记录。
+
+> 目录整理说明：历史报告及日志原样保留，内部可能仍含旧根目录绝对路径。重命名后的可用派生报告、诊断脚本新位置和环境重建规则见 [项目布局](project-layout.md)。派生报告不代表重新验收。
+
 ## 方法与环境
 
 - Windows 11，Python 3.14.4，psd-tools 1.26.1，串行、每样本独立子进程。
@@ -68,6 +72,42 @@ Python 相对输入分别减少约 94.90%、84.22%、95.89%。相对 JSX 参考�
 
 宿主局部证据保留在 `.prototype-data/user-acceptance/20261113_190200_219602/host-roundtrip-r3/`，不是最终自动报告目录；其生成文件不构成一份通过的完整宿主报告。
 
+### 后续单文件定位：根图层快照阶段超时
+
+用户确认关闭上一轮 Photoshop，随后重新启动空会话；联机预检为 Photoshop 21.2.12、0 个文档。本轮仅复制上轮大厅 `roundtrip.psb` 到新隔离目录，复用现有 `inspect`/`layers` 实现，执行打开及深层检查，不执行 PNG 导出、编辑保存或整批验收。
+
+- 命令：`.venv/Scripts/python.exe .prototype-data/diagnose_host.py`（临时诊断脚本，被 Git 忽略）。
+- 证据目录：`.prototype-data/host-diagnosis/20261113_203409/`，含计划、实际 JSX、阶段日志及超时记录。
+- 目标图层 ID 链为 `[475, 76, 69, 64]`。打开在 3302 ms 完成，根 XMP 读取后于 3384 ms 进入根图层快照采集；65 秒 watchdog 退出时没有该阶段完成记录，退出码 124。
+- 本次尚未进入嵌入编辑操作，明确的阻塞范围是根图层属性遍历，不是已经证实的嵌入打开失败。候选原因是属性读取累计成本、特定属性（如 bounds）成本或某个图层属性访问阻塞，均尚未证实。
+- 45 秒协作检查位于宿主阶段边界，不能中断单个长调用或没有返回的图层遍历；watchdog 退出也不取消 Photoshop 脚本。已停止自动操作并请用户检查会话，不自动重试。
+
+继续最小化与对照：
+
+- `20261113_204322`：去掉 bounds，增加遍历内部协作时限检查，仍在 45 秒退出；日志持续推进，没有固定在同一图层。
+- `20261113_204449`：进一步仅保留 DOM 结构遍历，仍在 45 秒退出；这两次均由协作异常返回并清理文档，而非外部 watchdog 退出。
+- `HOST_PROBE_MODE=action-manager .venv/Scripts/python.exe .prototype-data/diagnose_host.py`，证据 `20261113_204610`：改用 Action Manager 索引读取描述符，保留边界等图层属性，5830 ms 完成根及 4 层嵌入检查，文档数回到 0。证据支持 DOM 集合遍历路径是此次超时瓶颈，尚未进一步拆分其内部成本。
+
+### 修复后的大厅单文件宿主回归
+
+正式验证器改用 Action Manager 图层描述符：按索引记录 layerID、名称、组边界、图层类型、局部可见性、opacity、blend mode、bounds 和调整/填充图层描述符子类型。组边界保留结构；不捕获并忽略任意图层读取错误。保存逐层快照为 `snapshots.json`，使不一致可以定位到具体记录，而不只留下摘要。
+
+首两次正式回归不超时，但图层比较失败：根文档 1494 条记录中，ID 475 的局部可见性从 true 变为 false，其他记录相同。原因是原验证器将 DOM `visible`（受隐藏父组影响）写回图层，检查行为改变了隔离副本。移除不必要的可见性写入后，在完全相同的比较规则下第三次通过，不豁免可见性差异。
+
+只包含大厅的派生报告位于 `.prototype-data/host-regression/acceptance.json`，它引用最终自动报告中的同一 Python 输出，不替代最终报告。失败证据在 `hall-am-r1`、`hall-am-r2`；通过证据在 `hall-am-r3`；审查补强后的最终复跑在 `hall-am-r4`。命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m prototype.host_acceptance `
+  --report .prototype-data/host-regression/acceptance.json `
+  --output .prototype-data/host-regression/hall-am-r4 --timeout 65
+```
+
+第三次退出码 0：根及 4 层嵌入的祖先字段检查通过；保存重开前后图层快照完全一致，摘要均为 `91dd0302242eba3bc6b98e0c8f013961ad0d1e42748b64bce69dccdb6aa3b157`；PNG 解码像素相同；Python 输出未变化；结束文档数为 0。该结果解决大厅此次检查超时及验证器自身的可见性副作用，但**仍未执行嵌入内容编辑保存、共享实例关联行为验收，也未完成另外两份样本的宿主验收**，工单 01 不记为完成。
+
+双轴审查后补充调整/填充图层子类型：仅比较 Action Manager 的数值 layerKind 会把不同调整类型归为同类，弱于原 DOM kind 检查。现在额外比较 adjustment 列表中的对象类型，并在代码中注明持久快照位置字段含义。第四次正式回归全部通过，前后摘要均为 `3148033d5eb775dee0b96c1907b9553c2d15e4f453ff3649daabbb27fbddca1b`，文档数为 0。真实快照记录了 solidColorLayer、brightnessEvent、colorBalance、hueSaturation、exposure 子类型；没有通过放宽类型比较解决失败。
+
+27 项自动回归通过；修改后的 `prototype/host_acceptance.py` 通过 mypy 和编译检查。宿主缺陷通过真实外部验证边界得到失败→通过证据，未用 mock 或源码字符串断言冒充 Photoshop 回归。临时诊断脚本及输出仅留在被忽略的本地证据目录，不属于运行产品。
+
 ## 输入与参考指纹
 
 | 文件 | 输入 SHA-256 | JSX 参考 SHA-256 |
@@ -116,9 +156,9 @@ Python 相对输入分别减少约 94.90%、84.22%、95.89%。相对 JSX 参考�
 .\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py
 ```
 
-## 尚待完成
+## 当时尚待完成的项目（历史记录）
 
-1. 查明宿主深层重开检查的超时原因，安全完成三份文件的可编辑性及保存重开验收。
+1. 大厅的本次超时已定位并修复；继续安全完成另外两份文件的宿主验收，并补齐嵌入内容编辑保存及共享实例关联行为验收。
 2. 确认是否需要补充原生嵌入 PSD 样本；当前真实样本的内部文件均为 PSB。
 3. 对 JSX 差额进一步归因前，不把体积差额全部归为 Python 清理遗漏。
 4. 未完成项不会通过修改工单状态隐藏；不开始被 01、02 阻塞的 GUI 工单。

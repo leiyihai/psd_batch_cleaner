@@ -58,11 +58,37 @@ SCRIPT = r'''
         return String(v);
     }
     function layers(node) {
+        // DOM collections are prohibitively slow on large layer trees in PS 21.
+        // Action Manager includes group boundary records, preserving hierarchy
+        // in index order without repeatedly traversing the DOM layer collection.
+        app.activeDocument=node;
+        var ref=new ActionReference();
+        ref.putEnumerated(charIDToTypeID("Dcmn"),charIDToTypeID("Ordn"),charIDToTypeID("Trgt"));
+        var documentInfo=executeActionGet(ref);
+        var count=documentInfo.getInteger(stringIDToTypeID("numberOfLayers"));
+        var first=documentInfo.getBoolean(stringIDToTypeID("hasBackgroundLayer")) ? 0 : 1;
         var out=[];
-        for(var i=0;i<node.layers.length;i++) {
-            var l=node.layers[i];
-            out.push([l.name,l.typename,l.typename === "ArtLayer" ? String(l.kind) : "LayerSet",l.visible,l.opacity,String(l.blendMode),String(l.bounds)]);
-            if(l.typename === "LayerSet") { out.push(layers(l)); }
+        for(var i=first;i<=count;i++) {
+            var layerRef=new ActionReference();layerRef.putIndex(charIDToTypeID("Lyr "),i);
+            var d=executeActionGet(layerRef),bounds=[];
+            if(d.hasKey(stringIDToTypeID("bounds"))) {
+                var b=d.getObjectValue(stringIDToTypeID("bounds")),keys=["left","top","right","bottom"];
+                for(var j=0;j<keys.length;j++){bounds.push(b.getUnitDoubleValue(stringIDToTypeID(keys[j])));}
+            }
+            // layerKind alone groups all adjustment layers together. Retain
+            // their descriptor types (e.g. curves vs levels), including hidden layers.
+            var adjustmentTypes=[];
+            if(d.hasKey(stringIDToTypeID("adjustment"))) {
+                var adjustments=d.getList(stringIDToTypeID("adjustment"));
+                for(var a=0;a<adjustments.count;a++){adjustmentTypes.push(typeIDToStringID(adjustments.getObjectType(a)));}
+            }
+            // Snapshot record schema: ID, name, section, kind, local visibility,
+            // opacity (0..255), blend mode, pixel bounds, adjustment subtypes.
+            out.push([d.getInteger(stringIDToTypeID("layerID")),d.getString(stringIDToTypeID("name")),
+                typeIDToStringID(d.getEnumerationValue(stringIDToTypeID("layerSection"))),
+                d.hasKey(stringIDToTypeID("layerKind")) ? d.getInteger(stringIDToTypeID("layerKind")) : null,
+                d.getBoolean(stringIDToTypeID("visible")),d.getInteger(stringIDToTypeID("opacity")),
+                typeIDToStringID(d.getEnumerationValue(stringIDToTypeID("mode"))),bounds,adjustmentTypes]);
         }
         return out;
     }
@@ -76,14 +102,15 @@ SCRIPT = r'''
             var selection=new ActionDescriptor();selection.putReference(charIDToTypeID("null"),ref);
             selection.putBoolean(charIDToTypeID("MkVs"),false);
             executeAction(charIDToTypeID("slct"),selection,DialogModes.NO);
-            var layer=doc.activeLayer,visible=layer.visible;
             var count=app.documents.length;
             executeAction(stringIDToTypeID("placedLayerEditContents"),new ActionDescriptor(),DialogModes.NO);
             if(app.documents.length !== count+1 || app.activeDocument===doc) { throw new Error("Embedded document did not open independently"); }
             var child=app.activeDocument;owned.push(child);
             result=result.concat(inspect(child,depth+1));
             child.close(SaveOptions.DONOTSAVECHANGES);owned.pop();
-            app.activeDocument=doc;layer.visible=visible;doc.activeLayer=previous;
+            // Selection used MkVs=false; inspecting content must not write
+            // DOM visibility back (it can reflect hidden ancestor groups).
+            app.activeDocument=doc;doc.activeLayer=previous;
         }
         return result;
     }
@@ -183,6 +210,7 @@ def main() -> int:
                                "__CHAIN__": chain}.items():
                 script = script.replace(key, json.dumps(value, ensure_ascii=True))
             before, after = json.loads(str(app.DoJavaScript(script)))
+            atomic_json(directory / "snapshots.json", {"before": before, "after": after})
             with Image.open(directory / "before.png") as image:
                 left = image.convert("RGBA")
             with Image.open(directory / "after.png") as image:

@@ -1,20 +1,38 @@
 {
-    // 使用 IntelliSense 了解相关属性。 
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Python：自动回归测试",
+            "module": "unittest",
+            "args": ["discover", "-s", "tests", "-v"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Python：串行批处理",
+            "module": "prototype.batch",
+            "args": ["--input", "${input:inputDirectory}", "--output", "${input:outputDirectory}"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
             "type": "extendscript-debug",
             "request": "attach",
-            "name": "Attach to ExtendScript Engine",
-            "hostAppSpecifier": "photoshop-160.064"
+            "name": "历史 JSX：附加到 Photoshop"
         },
         {
             "type": "extendscript-debug",
             "request": "launch",
-            "name": "Launch Script in ExtendScript Engine",
-            "hostAppSpecifier": "photoshop-160.064"
+            "name": "历史 JSX：运行当前文档清理",
+            "script": "${workspaceFolder}/legacy/photoshop/PsDeepCleanerPlus.jsx"
         }
+    ],
+    "inputs": [
+        {"id": "inputDirectory", "type": "promptString", "description": "输入目录（请先备份素材）"},
+        {"id": "outputDirectory", "type": "promptString", "description": "独立输出目录（不得与输入目录相互包含）"}
     ]
 }
