@@ -55,10 +55,10 @@
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py prototype/gui.py tests/test_incremental.py tests/test_gui.py
+.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py prototype/gui.py tests/test_incremental.py tests/test_gui.py tests/fs_faults.py
 git diff --check
 ```
 
-全套 **88 项：83 通过、5 跳过**，19 项 Tk 与新增真实 junction 场景均实跑。跳过保持已有边界：4 个真实材料/Photoshop opt-in、1 个 Windows 缺少创建 symlink 权限，不视为已通过。7 个相关代码/测试文件 mypy 通过，差异空白检查通过。未将已知全目录历史类型问题或后续 07/08 计为本轮完成。
+全套 **88 项：83 通过、5 跳过**，19 项 Tk 与新增真实 junction 场景均实跑。跳过保持已有边界：4 个真实材料/Photoshop opt-in、1 个 Windows 缺少创建 symlink 权限，不视为已通过。8 个相关代码/测试文件 mypy 通过，差异空白检查通过。未将已知全目录历史类型问题或后续 07/08 计为本轮完成。
 
-双轴审查与本地提交见工单完成记录。
+首轮双轴审查：Spec 0 发现；Standards 0 硬性违规、1 项低优先级重复建议。已在 `tests/fs_faults.py` 提取共用 `forbid_file_access` 守卫，保留批处理、junction 和 GUI 各自的结果断言；提取后全套 88 项与 8 个相关文件类型检查再次通过。最终复核与本地提交见工单完成记录。

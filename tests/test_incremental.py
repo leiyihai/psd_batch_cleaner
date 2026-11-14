@@ -11,6 +11,7 @@ from unittest.mock import patch
 from prototype.batch import BatchEvent, run
 from prototype.cleaner import RULE_VERSION
 from test_prototype import tiny
+from fs_faults import forbid_file_access
 
 
 class IncrementalTests(unittest.TestCase):
@@ -71,18 +72,12 @@ class IncrementalTests(unittest.TestCase):
             records[str(source.resolve())]['output'] = 'alias/a.psd'
             cache_text = json.dumps(records)
             manifest.write_text(cache_text, encoding='utf-8')
-            path_open = Path.open
 
             def point_to(target):
                 if alias.exists():
                     alias.rmdir()
                 made = subprocess.run(['cmd', '/c', 'mklink', '/J', str(alias), str(target)], capture_output=True)
                 self.assertEqual(made.returncode, 0, repr(made.stderr))
-
-            def guarded_open(path, mode='r', *args, **kwargs):
-                if path.resolve() == external.resolve():
-                    self.fail('read escaped historical output through a junction')
-                return path_open(path, mode, *args, **kwargs)
 
             try:
                 for escape_at in ('load', 'use'):
@@ -95,7 +90,7 @@ class IncrementalTests(unittest.TestCase):
                             if escape_at == 'use' and event.phase == '检查变化':
                                 point_to(outside)
 
-                        with patch('pathlib.Path.open', new=guarded_open):
+                        with forbid_file_access(external):
                             with self.assertRaisesRegex(RuntimeError, '增量记录.*输出引用越界'):
                                 run(inputs, output, on_event=receive, emit=lambda _: None)
                         self.assertEqual(events[-1].kind, 'error')
@@ -120,7 +115,6 @@ class IncrementalTests(unittest.TestCase):
             records = json.loads(manifest.read_text(encoding='utf-8'))
             outside = base / 'outside.psd'
             outside.write_bytes(b'private external data')
-            path_open = Path.open
             for reference in ('../outside.psd', str(outside.resolve()), '..\\outside.psd', 'C:outside.psd'):
                 with self.subTest(reference=reference):
                     records[str(source.resolve())]['output'] = reference
@@ -128,12 +122,7 @@ class IncrementalTests(unittest.TestCase):
                     manifest.write_text(damaged, encoding='utf-8')
                     events: list[BatchEvent] = []
 
-                    def guarded_open(path, mode='r', *args, **kwargs):
-                        if path.resolve() == outside.resolve():
-                            self.fail('attempted to read outside the designated output')
-                        return path_open(path, mode, *args, **kwargs)
-
-                    with patch('pathlib.Path.open', new=guarded_open):
+                    with forbid_file_access(outside):
                         with self.assertRaisesRegex(RuntimeError, '增量记录.*输出'):
                             run(inputs, output, on_event=events.append, emit=lambda _: None)
                     self.assertEqual(events[-1].kind, 'error')

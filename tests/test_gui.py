@@ -15,7 +15,7 @@ from psd_tools.psd import PSD
 from prototype.batch import run
 from psd_tools.constants import Resource
 from test_prototype import tiny, embedded, XMP, TARGET_ELEMENT
-from fs_faults import fail_report_update_at
+from fs_faults import fail_report_update_at, forbid_file_access
 
 
 class GuiTests(unittest.TestCase):
@@ -238,17 +238,10 @@ class GuiTests(unittest.TestCase):
         escaped = {key: {**records[key], 'output': str(outside.resolve())}}
         damaged_cases = ['not JSON', json.dumps({key: None}), json.dumps(escaped),
                          json.dumps({key: {**records[key], 'source_hash': 'broken'}})]
-        path_open = Path.open
-
-        def guarded_open(path, mode='r', *args, **kwargs):
-            if path.resolve() == outside.resolve():
-                self.fail('GUI job attempted to read an out-of-bounds history file')
-            return path_open(path, mode, *args, **kwargs)
-
         for damaged in damaged_cases:
             with self.subTest(damaged=damaged):
                 manifest.write_text(damaged, encoding='utf-8')
-                with patch('pathlib.Path.open', new=guarded_open):
+                with forbid_file_access(outside):
                     self.app.start_button.invoke()
                     self.finish()
                 self.assertEqual(self.app.phase.get(), '任务异常')
