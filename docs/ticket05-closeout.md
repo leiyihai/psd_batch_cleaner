@@ -9,7 +9,7 @@ GUI 新增“安全停止”，闲置和终态时禁用。启动时创建并捕�
 - 批处理新增终态 `stopped`，携带真实处理数、扫描总量及报告路径；GUI 显示“已停止”、已处理/未处理及失败/部分清理数量，不冒充全部完成。发生任务级故障时错误优先于停止。
 - 正常完成、停止和任务异常后恢复目录、递归选项和开始按钮。下一轮使用新的停止信号，不继承上一轮请求。运行中关闭只提示停止或等待，不销毁正在写入的任务。
 - 损坏输入、解析和校验拒绝保持逐文件失败并继续；临时结果清理，不发布半成品。安全拒绝覆盖已有输出仍是单文件失败，既有文件不变。
-- 输出工作期间的实际系统 I/O 错误（带 `errno`）视为可能影响输出卷的任务级故障，立即终止后续文件；`psd-tools` 对非法内容抛出的无 `errno` 的 `OSError` 仍属于文件解析失败。输出阶段后续读源发生系统错误时也保守终止，不继续冒险发布。
+- 历史输出检查/读取及新输出工作期间的实际系统 I/O 错误（带 `errno`）视为可能影响输出卷的任务级故障，立即终止后续文件；`psd-tools` 对非法内容抛出的无 `errno` 的 `OSError` 仍属于文件解析失败。输出阶段后续读源发生系统错误时也保守终止，不继续冒险发布。
 - 缓存写入失败保留既有任务级终止行为；报告更新失败保留上次原子保存的报告，不尝试在失效位置继续整批。界面仍接收本次已处理文件的输出信息，明确显示任务异常；报告可能少于界面最后展示的文件，README 已说明不能将旧报告当作全量清单。
 - 锁冲突提示实际 `.cleaner.lock` 路径及“确认无任务后才手动处理”说明。只清理本任务独占创建的锁；创建后初次写入失败也释放锁。绝不移除另一任务的锁，无自动超时解锁或按 PID 强行解锁。
 
@@ -25,6 +25,8 @@ GUI 新增“安全停止”，闲置和终态时禁用。启动时创建并捕�
 4. 第二文件报告更新失败测试先因原始权限错误直接冒出且没有最后文件通知失败，再补最近可靠报告保留、实际输出通知及任务终止。
 5. 锁冲突测试先因只有原始 `FileExistsError` 失败，再补中文锁说明；同时把独占创建后的锁内容写入置于资源清理保护内。
 6. 回归暴露两种分类边界并修正：坏 PSD 的解析器 `OSError` 不能误判为磁盘故障；独占发布时发现已有文件必须安全拒绝覆盖，不改变既有单文件失败约定。
+7. Spec 首轮发现历史输出读取错误仍被当作单文件失败、发布后的大小读取失败可能遗漏已发布路径。分别先补公共 `run()` 失败测试，再把历史输出 `stat`/哈希检查纳入任务级输出异常保护（仅缺失才作为缓存未命中），把暂存大小读取移到发布前、发布后立即记录输出路径。
+8. Standards 首轮的两项低优先级重复建议已整理：`tests/fs_faults.py` 共用报告故障注入，GUI 共用门闩等待辅助方法；不改各场景的外部结果断言和 `finally` 释放约束。
 
 文件系统故障仅注入 `Path.open`/实际流写入、`os.link`、`os.replace`、`os.scandir` 边界；校验失败通过在校验阶段主动损坏隔离临时输出产生，使用真实字节校验和清理逻辑，不模拟内部清理调用次数。
 
@@ -36,7 +38,7 @@ GUI 新增“安全停止”，闲置和终态时禁用。启动时创建并捕�
 
 ## 可见窗口隔离验收
 
-证据 `.prototype-data/ticket05/20261114_135036_286960/`，包含 7 张窗口截图、`evidence.json`、各轮报告及输出。正式 `create_window()` 可见窗口运行，材料为隔离合成 PSD/PSB，不代表新增 Photoshop 原生兼容性验收；未访问用户素材，也未调用或结束 Photoshop。
+审查修正后最终复跑证据 `.prototype-data/ticket05/20261114_135855_941768/`，包含 7 张窗口截图、`evidence.json`、各轮报告及输出。正式 `create_window()` 可见窗口运行，材料为隔离合成 PSD/PSB，不代表新增 Photoshop 原生兼容性验收；未访问用户素材，也未调用或结束 Photoshop。
 
 | 场景 | 结果与文件证据 |
 | --- | --- |
@@ -53,10 +55,10 @@ GUI 新增“安全停止”，闲置和终态时禁用。启动时创建并捕�
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py prototype/gui.py tests/test_batch_stop.py tests/test_gui.py
+.\.venv\Scripts\python.exe -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs prototype/file_cleaner.py prototype/batch.py prototype/acceptance.py prototype/host_acceptance.py prototype/gui.py tests/test_batch_stop.py tests/test_gui.py tests/fs_faults.py
 git diff --check
 ```
 
-最终全套 **75 项：70 通过、5 跳过**，13 项 Tk 测试实际运行。5 个跳过沿用已有边界：4 个真实样本/Photoshop opt-in，1 个 Windows 缺少符号链接创建权限；不把跳过视为验收通过。7 个相关代码/测试文件 mypy 通过，差异空白检查通过。未将已知的全目录历史类型问题算作本轮已修复。
+最终全套 **77 项：72 通过、5 跳过**，13 项 Tk 测试实际运行。5 个跳过沿用已有边界：4 个真实样本/Photoshop opt-in，1 个 Windows 缺少符号链接创建权限；不把跳过视为验收通过。8 个相关代码/测试文件 mypy 通过，差异空白检查通过。未将已知的全目录历史类型问题算作本轮已修复。
 
 双轴审查及本地提交见工单完成记录。

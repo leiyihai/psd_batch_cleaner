@@ -140,7 +140,7 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
             row: dict[str, Any] = {"source": str(source), "status": "失败", "output": None}
             started = time.perf_counter()
             infrastructure_error: RuntimeError | None = None
-            writing_output = False
+            accessing_output = False
             try:
                 announce_phase('检查变化', source)
                 digest = sha256_file(source)
@@ -148,31 +148,43 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 previous = cache.get(key, {})
                 prior_path = output / previous.get("output", "")
                 # Never trust a cache path outside the designated output directory.
+                accessing_output = True
                 cached = (previous.get("rule") == RULE_VERSION and previous.get("source_hash") == digest
                           and previous.get("status") in ("成功", "无需清理")
-                          and output in prior_path.resolve().parents and prior_path.is_file())
-                if cached and sha256_file(prior_path) == previous.get("output_hash"):
+                          and output in prior_path.resolve().parents)
+                if cached:
+                    try:
+                        # is_file() suppresses OS errors; only missing outputs
+                        # are a cache miss, not an unreadable output volume.
+                        cached = (stat.S_ISREG(prior_path.stat().st_mode)
+                                  and sha256_file(prior_path) == previous.get("output_hash"))
+                    except FileNotFoundError:
+                        cached = False
+                accessing_output = False
+                if cached:
                     if sha256_file(source) != digest:
                         raise ValueError("输入在验证历史输出期间发生变化，稍后重试")
                     row.update(status="未变化", output=str(prior_path))
                 else:
                     announce_phase('清理中', source)
                     before = source.stat().st_size
-                    writing_output = True
+                    accessing_output = True
                     with tempfile.TemporaryDirectory(dir=run_dir) as temporary:
                         staged = Path(temporary) / "result.tmp"
                         result = clean_file(source, staged, on_validate=lambda: announce_phase('校验中', source))
                         output_hash = sha256_file(staged)
                         if sha256_file(source) != digest:
                             raise ValueError("输入在清理期间发生变化，取消发布")
+                        after = staged.stat().st_size
                         destination = run_dir / "files" / source.relative_to(root)
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         try:
                             os.link(staged, destination)
                         except FileExistsError as exc:
                             raise ValueError(f'输出已存在，拒绝覆盖：{destination}') from exc
-                        row.update(status=result.status, output=str(destination), before=before,
-                                   after=staged.stat().st_size, removed=result.removed,
+                        row['output'] = str(destination)
+                        row.update(status=result.status, before=before,
+                                   after=after, removed=result.removed,
                                    documents=result.documents, skipped_links=result.linked,
                                    issues=result.issues, max_depth=result.max_depth,
                                    xmp_bytes=result.xmp_bytes, embedded_psd=result.embedded_psd,
@@ -189,7 +201,7 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
                 # psd-tools also raises OSError without errno for malformed
                 # content. Only actual OS I/O errors here indicate a potentially
                 # unavailable output volume; parser rejections remain per-file.
-                if writing_output and isinstance(exc, OSError) and exc.errno is not None:
+                if accessing_output and isinstance(exc, OSError) and exc.errno is not None:
                     infrastructure_error = RuntimeError(f'输出读写或发布失败，任务终止：{exc}')
                 row["status"] = "失败"
                 row["error"] = str(infrastructure_error or exc)

@@ -10,6 +10,7 @@ import unittest
 
 from prototype.batch import BatchEvent, run
 from test_prototype import tiny
+from fs_faults import fail_report_update_at
 
 
 class BatchStopTests(unittest.TestCase):
@@ -145,16 +146,7 @@ class BatchStopTests(unittest.TestCase):
                 (inputs / name).write_bytes(tiny())
             output = base / 'output'
             events: list[BatchEvent] = []
-            replace = os.replace
-
-            def report_unavailable(source, destination):
-                if Path(destination).name == 'report.json':
-                    rows = json.loads(Path(source).read_text(encoding='utf-8'))
-                    if len(rows) == 2:
-                        raise PermissionError('报告目录不可写')
-                return replace(source, destination)
-
-            with patch('os.replace', side_effect=report_unavailable):
+            with fail_report_update_at(2):
                 with self.assertRaisesRegex(RuntimeError, '结果报告.*任务终止'):
                     run(inputs, output, on_event=events.append, emit=lambda _: None)
             self.assertEqual(events[-1].kind, 'error')
@@ -170,6 +162,69 @@ class BatchStopTests(unittest.TestCase):
             self.assertFalse((output / '.cleaner.lock').exists())
             retried, _ = run(inputs, output, emit=lambda _: None)
             self.assertEqual([row['status'] for row in retried], ['未变化', '未变化', '成功'])
+
+    def test_historical_output_read_error_terminates_task_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            inputs = base / 'input'
+            inputs.mkdir()
+            for name in ('a.psd', 'b.psd'):
+                (inputs / name).write_bytes(tiny())
+            output = base / 'output'
+            previous, old_report = run(inputs, output, emit=lambda _: None)
+            historical = Path(previous[0]['output'])
+            original_output = historical.read_bytes()
+            original_report = old_report.read_bytes()
+            path_open = Path.open
+            events: list[BatchEvent] = []
+
+            def failing_read(path, mode='r', *args, **kwargs):
+                if path == historical and mode == 'rb':
+                    raise OSError(errno.EIO, '历史输出读取失败', str(path))
+                return path_open(path, mode, *args, **kwargs)
+
+            with patch('pathlib.Path.open', new=failing_read):
+                with self.assertRaisesRegex(RuntimeError, '历史输出读取失败'):
+                    run(inputs, output, on_event=events.append, emit=lambda _: None)
+            self.assertEqual(events[-1].kind, 'error')
+            files = [event for event in events if event.kind == 'file']
+            self.assertEqual(len(files), 1)
+            assert files[0].row is not None and files[0].report is not None
+            self.assertEqual(files[0].row['status'], '失败')
+            self.assertEqual(len(json.loads(files[0].report.read_text(encoding='utf-8'))), 1)
+            self.assertEqual(historical.read_bytes(), original_output)
+            self.assertEqual(old_report.read_bytes(), original_report)
+            self.assertFalse((output / '.cleaner.lock').exists())
+            retried, _ = run(inputs, output, emit=lambda _: None)
+            self.assertEqual([row['status'] for row in retried], ['未变化', '未变化'])
+
+    def test_published_output_is_reported_without_relying_on_later_staged_stat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            inputs = base / 'input'
+            inputs.mkdir()
+            (inputs / 'a.psd').write_bytes(tiny())
+            output = base / 'output'
+            link, path_stat = os.link, Path.stat
+            published = []
+
+            def publish(source, destination):
+                link(source, destination)
+                published.append(Path(destination))
+
+            def inaccessible_staged(path, *args, **kwargs):
+                if published and path.name == 'result.tmp':
+                    raise OSError(errno.EIO, '发布后暂存元数据不可读', str(path))
+                return path_stat(path, *args, **kwargs)
+
+            with patch('os.link', side_effect=publish), patch('pathlib.Path.stat', new=inaccessible_staged):
+                rows, report = run(inputs, output, emit=lambda _: None)
+            self.assertEqual(rows[0]['status'], '成功')
+            self.assertEqual(rows[0]['output'], str(published[0]))
+            self.assertTrue(published[0].is_file())
+            self.assertEqual(rows[0]['after'], published[0].stat().st_size)
+            self.assertEqual(json.loads(report.read_text(encoding='utf-8')), rows)
+            self.assertFalse((output / '.cleaner.lock').exists())
 
     def test_output_publication_failure_terminates_task_and_can_retry(self):
         with tempfile.TemporaryDirectory() as temporary:

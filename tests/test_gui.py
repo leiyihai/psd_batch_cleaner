@@ -13,6 +13,7 @@ from psd_tools.psd import PSD
 from prototype.batch import run
 from psd_tools.constants import Resource
 from test_prototype import tiny, embedded, XMP, TARGET_ELEMENT
+from fs_faults import fail_report_update_at
 
 
 class GuiTests(unittest.TestCase):
@@ -43,6 +44,13 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(self.app.start_button.instate(['disabled']), 'GUI job did not finish')
         self.root.update()
 
+    def wait_for(self, event):
+        deadline = time.monotonic() + 5
+        while not event.is_set() and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(.01)
+        self.assertTrue(event.is_set(), 'filesystem gate was not entered')
+
     def test_stop_waits_for_current_write_or_validation_and_can_restart(self):
         original = tiny()
         for name in ('a.psd', 'b.psd'):
@@ -65,11 +73,7 @@ class GuiTests(unittest.TestCase):
                 with patch('pathlib.Path.open', new=gated_open):
                     self.app.start_button.invoke()
                     try:
-                        deadline = time.monotonic() + 5
-                        while not entered.is_set() and time.monotonic() < deadline:
-                            self.root.update()
-                            time.sleep(.01)
-                        self.assertTrue(entered.is_set())
+                        self.wait_for(entered)
                         lock = output / '.cleaner.lock'
                         owner = lock.read_bytes()
                         with self.assertRaisesRegex(RuntimeError, '已有任务'):
@@ -107,16 +111,7 @@ class GuiTests(unittest.TestCase):
     def test_report_failure_preserves_outputs_shows_task_error_and_can_restart(self):
         for name in ('a.psd', 'b.psd', 'c.psd'):
             (self.inputs / name).write_bytes(tiny())
-        replace = os.replace
-
-        def report_unavailable(source, destination):
-            if Path(destination).name == 'report.json':
-                rows = json.loads(Path(source).read_text(encoding='utf-8'))
-                if len(rows) == 2:
-                    raise PermissionError('报告目录不可写')
-            return replace(source, destination)
-
-        with patch('os.replace', side_effect=report_unavailable):
+        with fail_report_update_at(2):
             self.app.start_button.invoke()
             self.finish()
         self.assertEqual(self.app.phase.get(), '任务异常')
@@ -150,11 +145,7 @@ class GuiTests(unittest.TestCase):
         with patch('os.scandir', side_effect=gated_scan):
             self.app.start_button.invoke()
             try:
-                deadline = time.monotonic() + 5
-                while not entered.is_set() and time.monotonic() < deadline:
-                    self.root.update()
-                    time.sleep(.01)
-                self.assertTrue(entered.is_set())
+                self.wait_for(entered)
                 self.app.stop_button.invoke()
                 self.root.update()
                 self.assertEqual(self.app.phase.get(), '请求停止')
