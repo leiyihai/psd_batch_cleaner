@@ -33,7 +33,9 @@ def discover(root: Path, *, recursive: bool = True):
     def fail(error):
         raise error
     for current, directories, names in os.walk(root, followlinks=False, onerror=fail):
-        directories[:] = sorted(d for d in directories if not Path(current, d).is_symlink()) if recursive else []
+        directories[:] = sorted(d for d in directories
+                                if not Path(current, d).is_symlink()
+                                and not Path(current, d).is_junction()) if recursive else []
         for name in sorted(names):
             path = Path(current, name)
             if path.suffix.lower() in (".psd", ".psb") and not path.is_symlink():
@@ -63,6 +65,8 @@ class BatchEvent:
     row: dict[str, Any] | None = None
     report: Path | None = None
     message: str = ''
+    total: int | None = None
+    completed: int = 0
 
 
 def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
@@ -71,12 +75,12 @@ def run(input_dir: Path, output_dir: Path, *, stop=None, emit=print,
     notify = on_event if on_event is not None else lambda event: None
     try:
         notify(BatchEvent('phase', phase='扫描文件'))
-        rows, report = _run(input_dir, output_dir, stop=stop, emit=emit,
+        rows, report, total = _run(input_dir, output_dir, stop=stop, emit=emit,
                             selected_files=selected_files, recursive=recursive, notify=notify)
     except Exception as exc:
         notify(BatchEvent('error', message=str(exc)))
         raise
-    notify(BatchEvent('finished', report=report))
+    notify(BatchEvent('finished', report=report, total=total, completed=len(rows)))
     return rows, report
 
 
@@ -110,9 +114,14 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
         run_dir.mkdir()
         rows = []
         report = run_dir / "report.json"
-        for source in discover(root, recursive=recursive):
-            if selection is not None and source not in selection:
-                continue
+        # Freeze the selected scope before processing: a failed scan must never
+        # publish a partial total or be mistaken for a completed directory tree.
+        sources = [source for source in discover(root, recursive=recursive)
+                   if selection is None or source in selection]
+        total = len(sources)
+        notify(BatchEvent('scanned', total=total))
+        emit(f'扫描完成：共 {total} 个文件')
+        for source in sources:
             if stop.is_set():
                 break
             row: dict[str, Any] = {"source": str(source), "status": "失败", "output": None}
@@ -164,23 +173,26 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
             row["elapsed_seconds"] = round(time.perf_counter() - started, 6)
             rows.append(row)
             atomic_json(report, rows)
-            notify(BatchEvent('file', source=source, row=dict(row), report=report))
+            notify(BatchEvent('file', source=source, row=dict(row), report=report,
+                              total=total, completed=len(rows)))
             emit(f"{row['status']}：{source}" + (f"；{row['error']}" if "error" in row else ""))
             if infrastructure_error is not None:
                 raise infrastructure_error
         # Even an empty input or a cancelled run has a report.
         atomic_json(report, rows)
-        return rows, report
+        return rows, report, total
     finally:
         lock.unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="PSD/PSB 串行批处理：生成独立瘦身副本")
-    parser.add_argument("--input", type=Path, required=True, help="输入目录，递归扫描 PSD/PSB")
+    parser.add_argument("--input", type=Path, required=True, help="输入目录，扫描 PSD/PSB")
     parser.add_argument("--output", type=Path, required=True, help="独立输出目录；每次运行生成新子目录")
+    parser.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True,
+                        help='包含子文件夹（默认开启）；--no-recursive 仅扫描当前层级')
     args = parser.parse_args()
-    rows, report = run(args.input, args.output)
+    rows, report = run(args.input, args.output, recursive=args.recursive)
     print(f"结果报告：{report}")
     return 1 if any(row["status"] == "失败" for row in rows) else 0
 

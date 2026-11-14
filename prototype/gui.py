@@ -18,10 +18,11 @@ class CleanerWindow(ttk.Frame):
         super().__init__(master, padding=24)
         self.input_path = tk.StringVar(master)
         self.output_path = tk.StringVar(master)
+        self.recursive = tk.BooleanVar(master, True)
         self.phase = tk.StringVar(master, '就绪')
         self.current_file = tk.StringVar(master, '尚未开始')
         self.report_path = tk.StringVar(master)
-        self.summary = tk.StringVar(master, '仅处理输入目录当前层级的 PSD / PSB，不包含子目录。')
+        self.summary = tk.StringVar(master, '默认包含子文件夹；瘦身副本保留输入相对路径。')
         self._messages: queue.Queue[BatchEvent] = queue.Queue()
         self._running = False
         self._rows: dict[str, dict[str, Any]] = {}
@@ -48,6 +49,8 @@ class CleanerWindow(ttk.Frame):
         bar.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(16, 8))
         self.start_button = ttk.Button(bar, text='开始瘦身', style='Accent.TButton', command=self.start)
         self.start_button.pack(side='left')
+        self.recursive_check = ttk.Checkbutton(bar, text='包含子文件夹', variable=self.recursive)
+        self.recursive_check.pack(side='left', padx=(12, 0))
         ttk.Label(bar, textvariable=self.phase).pack(side='left', padx=18, fill='x', expand=True)
         self.progress = ttk.Progressbar(bar, mode='indeterminate', length=180)
         self.progress.pack(side='right')
@@ -90,18 +93,20 @@ class CleanerWindow(ttk.Frame):
 
     def _set_busy(self, busy: bool) -> None:
         self._running = busy
-        for widget in (self.input_entry, self.output_entry, self.input_browse, self.output_browse, self.start_button):
+        for widget in (self.input_entry, self.output_entry, self.input_browse, self.output_browse,
+                       self.start_button, self.recursive_check):
             widget.state(['disabled'] if busy else ['!disabled'])
         if busy:
+            self.progress.configure(mode='indeterminate', value=0)
             self.progress.start(15)
-        else:
+        elif str(self.progress['mode']) == 'indeterminate':
             self.progress.stop()
-            self.progress.configure(value=0)
 
     def start(self) -> None:
         if self._running:
             return
         source, output = self.input_path.get().strip(), self.output_path.get().strip()
+        recursive = self.recursive.get()
         if not source or not output:
             self.phase.set('任务异常')
             self._log('请填写输入目录和独立输出目录。')
@@ -120,11 +125,11 @@ class CleanerWindow(ttk.Frame):
         # Capture strings now: even programmatic StringVar edits cannot alter
         # this job. The non-daemon worker is never killed halfway through writing.
         try:
-            threading.Thread(target=self._work, args=(source, output), daemon=False).start()
+            threading.Thread(target=self._work, args=(source, output, recursive), daemon=False).start()
         except Exception as exc:
             self._messages.put(BatchEvent('error', message=str(exc)))
 
-    def _work(self, source: str, output: str) -> None:
+    def _work(self, source: str, output: str, recursive: bool) -> None:
         error_sent = False
 
         def receive(event: BatchEvent) -> None:
@@ -134,7 +139,7 @@ class CleanerWindow(ttk.Frame):
             self._messages.put(event)
 
         try:
-            run(Path(source).expanduser(), Path(output).expanduser(), recursive=False,
+            run(Path(source).expanduser(), Path(output).expanduser(), recursive=recursive,
                 emit=lambda message: None, on_event=receive)
         except Exception as exc:
             # Setup can fail before run emits anything; always deliver one
@@ -157,7 +162,14 @@ class CleanerWindow(ttk.Frame):
             if event.source is not None:
                 self.current_file.set(str(event.source))
             self._log(event.phase + (f'：{event.source}' if event.source else ''))
+        elif event.kind == 'scanned':
+            self.progress.stop()
+            self.progress.configure(mode='determinate', maximum=max(event.total or 0, 1), value=0)
+            self.summary.set(f'扫描完成：0 / {event.total} 个文件。')
+            self._log(f'扫描完成：共 {event.total} 个文件。')
         elif event.kind == 'file' and event.row is not None:
+            self.progress.configure(value=event.completed)
+            self.summary.set(f'已处理 {event.completed} / {event.total} 个文件；原稿不覆盖。')
             row = event.row
             item = self.results.insert('', 'end', values=(row['status'], row['source'], row['output'] or '未发布'))
             self._rows[item] = row
@@ -176,7 +188,7 @@ class CleanerWindow(ttk.Frame):
             failed = sum(row['status'] == '失败' for row in self._rows.values())
             partial = sum(row['status'] == '部分清理' for row in self._rows.values())
             self.phase.set('处理结束（存在失败）' if failed else '处理结束（存在部分清理）' if partial else '处理完成')
-            self.summary.set(f'本轮 {len(self._rows)} 个文件，失败 {failed} 个，部分清理 {partial} 个。' if self._rows else '当前目录没有可处理的 PSD / PSB 文件（不扫描子目录）。')
+            self.summary.set(f'本轮 {event.completed} / {event.total} 个文件，失败 {failed} 个，部分清理 {partial} 个。' if self._rows else '本轮扫描范围内没有可处理的 PSD / PSB 文件（0 / 0）。')
             self.report_path.set(str(event.report or ''))
             self._log(self.phase.get() + '；' + self.summary.get())
 
@@ -232,7 +244,7 @@ def create_window() -> tuple[tk.Tk, CleanerWindow]:
 
 
 def main() -> None:
-    argparse.ArgumentParser(description='PSD Batch Cleaner 中文串行窗口（仅当前目录）').parse_args()
+    argparse.ArgumentParser(description='PSD Batch Cleaner 中文串行窗口（可选包含子文件夹）').parse_args()
     root, _ = create_window()
     root.mainloop()
 

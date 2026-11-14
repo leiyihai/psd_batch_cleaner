@@ -40,7 +40,44 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(self.app.start_button.instate(['disabled']), 'GUI job did not finish')
         self.root.update()
 
+    def test_recursive_option_defaults_on_maps_nested_names_and_freezes_scope(self):
+        (self.inputs / '子目录' / '多层 空格').mkdir(parents=True)
+        (self.inputs / '空目录').mkdir()
+        originals = {
+            '同名.PSD': tiny(),
+            '子目录/同名.PSD': tiny(2),
+            '子目录/多层 空格/设计.PsB': tiny(2),
+        }
+        for relative, content in originals.items():
+            (self.inputs / relative).write_bytes(content)
+        (self.inputs / '忽略.jpg').write_bytes(b'not PSD')
+        self.assertTrue(self.app.recursive.get())
+        self.app.start_button.invoke()
+        self.assertTrue(self.app.recursive_check.instate(['disabled']))
+        self.app.recursive.set(False)  # Cannot alter the captured running scope.
+        self.finish()
+        self.assertEqual(len(self.app.results.get_children()), 3)
+        self.assertEqual(str(self.app.progress['mode']), 'determinate')
+        self.assertEqual(float(self.app.progress['value']), 3)
+        self.assertEqual(float(self.app.progress['maximum']), 3)
+        self.assertIn('3 / 3', self.app.summary.get())
+        self.assertFalse(self.app.recursive_check.instate(['disabled']))
+        run_dir = next(self.output.glob('*/report.json')).parent
+        self.assertEqual(sorted(p.relative_to(run_dir / 'files').as_posix()
+                                for p in (run_dir / 'files').rglob('*') if p.is_file()), sorted(originals))
+        for relative, content in originals.items():
+            self.assertEqual((self.inputs / relative).read_bytes(), content)
+            self.assertLess((run_dir / 'files' / relative).stat().st_size, len(content))
+        self.app.start_button.invoke()  # The next job uses the changed setting.
+        self.finish()
+        self.assertEqual(len(self.app.results.get_children()), 1)
+        self.assertIn('1 / 1', self.app.summary.get())
+        self.assertEqual(len(list(self.output.glob('*/report.json'))), 2)
+        self.assertTrue((run_dir / 'files' / '子目录' / '同名.PSD').is_file())
+
     def test_start_cleans_current_level_and_keeps_window_responsive(self):
+        self.app.recursive_check.invoke()
+        self.assertFalse(self.app.recursive.get())
         original = tiny()
         source = self.inputs / '设计.PSD'
         source.write_bytes(original)
@@ -68,6 +105,29 @@ class GuiTests(unittest.TestCase):
         text = self.app.activity.get('1.0', 'end')
         for phase in ('检查变化', '清理中', '校验中'):
             self.assertIn(phase, text)
+
+    def test_scan_permission_error_is_visible_without_partial_total_or_results(self):
+        denied = self.inputs / '拒绝扫描'
+        denied.mkdir()
+        original = tiny()
+        (self.inputs / 'a.psd').write_bytes(original)
+        scandir = os.scandir
+
+        def unavailable(path):
+            if Path(path) == denied.resolve():
+                raise PermissionError('无权限扫描子目录')
+            return scandir(path)
+
+        with patch('os.scandir', side_effect=unavailable):
+            self.app.start_button.invoke()
+            self.finish()
+        self.assertEqual(self.app.phase.get(), '任务异常')
+        self.assertIn('无权限扫描子目录', self.app.activity.get('1.0', 'end'))
+        self.assertNotIn('扫描完成', self.app.activity.get('1.0', 'end'))
+        self.assertEqual(len(self.app.results.get_children()), 0)
+        self.assertFalse(self.app.recursive_check.instate(['disabled']))
+        self.assertEqual((self.inputs / 'a.psd').read_bytes(), original)
+        self.assertFalse(list(self.output.glob('*/files/*')))
 
     def test_directory_errors_restore_controls_and_preserve_another_job_lock(self):
         self.output.mkdir()
@@ -125,10 +185,12 @@ class GuiTests(unittest.TestCase):
         self.assertIn('不能相互包含', self.app.activity.get('1.0', 'end'))
 
     def test_empty_input_is_explicit_and_output_file_is_not_overwritten(self):
+        (self.inputs / '空目录' / '多层').mkdir(parents=True)
         self.app.start_button.invoke()
         self.finish()
         self.assertEqual(self.app.phase.get(), '处理完成')
         self.assertIn('没有可处理', self.app.summary.get())
+        self.assertIn('0 / 0', self.app.summary.get())
         occupied = self.base / 'occupied'
         occupied.write_text('preserve', encoding='utf-8')
         self.app.output_path.set(str(occupied))
