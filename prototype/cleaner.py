@@ -17,7 +17,7 @@ from psd_tools.psd import PSD
 if version("psd-tools") != "1.26.1":
     raise RuntimeError("此验证原型仅支持 psd-tools 1.26.1，请使用项目虚拟环境并安装 requirements.txt")
 
-RULE_VERSION = "ancestors-file-patches-v3-validated-psdtools-1.26.1"
+RULE_VERSION = "ancestors-file-patches-v4-stream-layer-records-psdtools-1.26.1"
 PHOTOSHOP_NS = "http://ns.adobe.com/photoshop/1.0/"
 TARGET = PHOTOSHOP_NS + "}DocumentAncestors"
 LINK_TAGS = (Tag.LINKED_LAYER1, Tag.LINKED_LAYER2, Tag.LINKED_LAYER3, Tag.LINKED_LAYER_EXTERNAL)
@@ -37,8 +37,8 @@ def strip_ancestors(packet: bytes) -> tuple[bytes, int]:
     if b"\x00" in packet:
         raise UnsafeFile("暂不支持含 NUL 的 XMP 编码")
     parser = expat.ParserCreate(namespace_separator="}")
-    namespace_stack = [{"xml": "http://www.w3.org/XML/1998/namespace"}]
-    pending_namespaces = []
+    namespace_stack: list[dict[str, str | None]] = [{"xml": "http://www.w3.org/XML/1998/namespace"}]
+    pending_namespaces: list[tuple[str, str | None]] = []
     elements = []
     removals = []
     count = 0
@@ -104,7 +104,7 @@ def strip_ancestors(packet: bytes) -> tuple[bytes, int]:
         parser.EndElementHandler = None
         parser.StartDoctypeDeclHandler = None
     # Merge nested removals; leave every unrelated byte (including packet padding) intact.
-    merged = []
+    merged: list[tuple[int, int]] = []
     for begin, finish in sorted(removals):
         if merged and begin <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
@@ -144,7 +144,7 @@ def clean_bytes(data: bytes, *, max_depth: int = 16, max_total_bytes: int = 2 * 
     A byte-exact unmodified read/write roundtrip is mandatory before changing a document.
     This intentionally rejects some valid files rather than silently dropping opaque bytes.
     """
-    memo = {}
+    memo: dict[bytes, Result] = {}
     total = 0
 
     def visit(blob, depth, location):

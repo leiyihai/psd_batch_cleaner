@@ -5,6 +5,7 @@ The psd-tools header/descriptor readers and tag definitions supply format semant
 """
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
@@ -12,15 +13,17 @@ import struct
 import zlib
 from typing import BinaryIO, Any, Callable, cast
 
-from psd_tools.constants import Tag
+from psd_tools.constants import Compression, Tag
 from psd_tools.psd.header import FileHeader
 from psd_tools.psd.descriptor import DescriptorBlock
-from psd_tools.psd.layer_and_mask import LayerInfo, LayerInfoBlock
+from psd_tools.psd.layer_and_mask import LayerRecord
+from psd_tools.psd.parse_limits import parse_container, parse_context
 from psd_tools.psd.tagged_blocks import TaggedBlock
 
 from prototype.cleaner import LINK_TAGS, UnsafeFile, strip_ancestors
 
 CHUNK = 4 * 1024**2
+LAYER_METADATA_LIMIT = 128 * 1024**2
 LINK_KEYS = {tag.value for tag in LINK_TAGS}
 BIG_KEYS = {tag.value for tag in TaggedBlock._BIG_KEYS}
 ALTERNATIVE_LAYER_KEYS = {Tag.LAYER_16.value, Tag.LAYER_32.value, Tag.LAYER.value}
@@ -114,10 +117,58 @@ class Planner:
         DescriptorBlock.read(cast(BinaryIO, bounded), padding=1)
 
     def layer_info(self, window: Window, version: int, *, block: bool = False) -> None:
-        reader = LayerInfoBlock if block else LayerInfo
-        info = reader.read(cast(BinaryIO, window), version=version)
-        if any(channel.length == 1 for record in info.layer_records for channel in record.channel_info):
-            raise UnsafeFile("图层通道长度为 1，缺少完整压缩头")
+        if block:
+            # Keep LayerInfoBlock's enclosing descriptor/object nesting budget.
+            with parse_context(), parse_container():
+                self._layer_info_records(window, version, block=True)
+        else:
+            self._layer_info_records(window, version, block=False)
+
+    def _layer_info_records(self, window: Window, version: int, *, block: bool) -> None:
+        # LayerInfo contains both records and *all* channel pixels. Budget the
+        # records/index, not the pixel payload; do not bulk-load the outer
+        # ChannelImageData. Record extra tags still use the library parser.
+        if block:
+            end = window.end
+        else:
+            size = window.uint(8 if version == 2 else 4)
+            end = window.tell() + size
+            if end > window.end:
+                raise UnsafeFile("图层信息区越界")
+            if not size:
+                return
+        start = window.tell()
+        body = Window(self.fp, start, end)
+        count = int.from_bytes(body.read(2), 'big', signed=True)
+        cursor = body.tell()
+        lengths: array[int] = array('Q')
+        for _ in range(abs(count)):
+            budget_end = min(end, start + LAYER_METADATA_LIMIT - len(lengths) * lengths.itemsize)
+            record_window = Window(self.fp, cursor, budget_end)
+            try:
+                record = LayerRecord.read(cast(BinaryIO, record_window), version=version)
+            except (UnsafeFile, OSError) as exc:
+                if budget_end < end:
+                    raise UnsafeFile(f"图层记录元数据无法在 128 MiB 预算内安全读取：{exc}") from exc
+                raise
+            cursor = record_window.tell()
+            for channel in record.channel_info:
+                if channel.length == 1:
+                    raise UnsafeFile("图层通道长度为 1，缺少完整压缩头")
+                if channel.length:
+                    if cursor - start + (len(lengths) + 1) * lengths.itemsize > LAYER_METADATA_LIMIT:
+                        raise UnsafeFile("图层记录元数据及通道索引超过 128 MiB 校验预算")
+                    lengths.append(channel.length)
+            del record
+        pixels = Window(self.fp, cursor, end)
+        for length in lengths:
+            # Match psd-tools ChannelData.read: validate the compression enum
+            # and declared bounds, but do not decompress/re-encode layer pixels.
+            Compression(pixels.uint(2))
+            pixels.skip(length - 2)
+        # Preserve opaque trailing allocation/padding, just as the bounded
+        # LayerInfo reader did. The copy/verify gate checks these bytes too.
+        window.seek(end)
 
     def merged_image(self, w: Window, header: Any) -> None:
         compression = w.uint(2)
@@ -232,11 +283,6 @@ class Planner:
         layer_delta = 0
         if layer_size:
             layers = Window(self.fp, layer_start, layer_end)
-            layer_info_at = layers.tell()
-            layer_info_size = layers.uint(width)
-            if layer_info_size > 128 * 1024**2:
-                raise UnsafeFile("图层记录区超过 128 MiB 校验上限")
-            layers.seek(layer_info_at)
             # Read-only validation; pixels/records remain byte-copied, never serialized.
             self.layer_info(layers, version)
             if layers.end - layers.tell() >= 4:
@@ -264,8 +310,6 @@ class Planner:
                 if key in ALTERNATIVE_LAYER_KEYS:
                     if key == Tag.LAYER.value:
                         raise UnsafeFile("暂不支持安全验证 Layr 替代图层存储，拒绝发布")
-                    if length > 128 * 1024**2:
-                        raise UnsafeFile("替代图层记录区超过 128 MiB 校验上限")
                     self.layer_info(Window(self.fp, payload, payload + length), version, block=True)
                 if key in LINK_KEYS:
                     delta = self.linked(payload, length, depth, label)
