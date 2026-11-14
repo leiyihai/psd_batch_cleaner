@@ -1,4 +1,5 @@
 """Shared batch interface used by the GUI, with real files and outputs."""
+from contextlib import contextmanager
 import io
 import json
 import os
@@ -6,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 from test_prototype import tiny, XMP, TARGET_ELEMENT
 from psd_tools.psd import PSD
@@ -72,6 +73,40 @@ class BatchGuiContractTests(unittest.TestCase):
             run(inputs, base / 'selected', selected_files={second},
                 on_event=selected_events.append, emit=lambda _: None)
             self.assertEqual(next(e.total for e in selected_events if e.kind == 'scanned'), 1)
+
+    def test_entry_classification_error_cannot_silently_omit_a_subtree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            inputs = base / 'input'
+            denied = inputs / '无法读取类型'
+            denied.mkdir(parents=True)
+            original = tiny()
+            (denied / 'hidden.psd').write_bytes(original)
+            events = []
+            scandir = os.scandir
+
+            @contextmanager
+            def inaccessible_entry(path):
+                with scandir(path) as entries:
+                    replaced = []
+                    for entry in entries:
+                        if Path(entry.path) == denied.resolve():
+                            blocked = Mock(wraps=entry)
+                            blocked.name = entry.name
+                            blocked.is_dir.side_effect = PermissionError('目录项类型不可读')
+                            blocked.stat.side_effect = PermissionError('目录项类型不可读')
+                            replaced.append(blocked)
+                        else:
+                            replaced.append(entry)
+                    yield iter(replaced)
+
+            with patch('os.scandir', side_effect=inaccessible_entry):
+                with self.assertRaisesRegex(PermissionError, '目录项类型不可读'):
+                    run(inputs, base / 'output', on_event=events.append, emit=lambda _: None)
+            self.assertEqual(events[-1].kind, 'error')
+            self.assertFalse(any(e.kind in ('scanned', 'file', 'finished') for e in events))
+            self.assertEqual((denied / 'hidden.psd').read_bytes(), original)
+            self.assertFalse((base / 'output' / '.cleaner.lock').exists())
 
     def test_scan_failure_never_claims_total_or_completion_and_preserves_history(self):
         with tempfile.TemporaryDirectory() as temporary:

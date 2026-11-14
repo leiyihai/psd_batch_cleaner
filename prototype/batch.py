@@ -7,6 +7,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
 import threading
@@ -30,16 +31,24 @@ def sha256_file(path: Path) -> str:
 
 
 def discover(root: Path, *, recursive: bool = True):
-    def fail(error):
-        raise error
-    for current, directories, names in os.walk(root, followlinks=False, onerror=fail):
-        directories[:] = sorted(d for d in directories
-                                if not Path(current, d).is_symlink()
-                                and not Path(current, d).is_junction()) if recursive else []
-        for name in sorted(names):
-            path = Path(current, name)
-            if path.suffix.lower() in (".psd", ".psb") and not path.is_symlink():
-                yield path
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        directories = []
+        with os.scandir(current) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                # os.walk suppresses is_dir() errors. Explicit non-following
+                # stat must succeed before we can claim a complete scan.
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode) or entry.is_junction():
+                    continue
+                path = Path(entry.path)
+                if stat.S_ISDIR(metadata.st_mode):
+                    if recursive:
+                        directories.append(path)
+                elif stat.S_ISREG(metadata.st_mode) and path.suffix.lower() in ('.psd', '.psb'):
+                    yield path
+        pending.extend(reversed(directories))
 
 
 def atomic_json(path, value):
