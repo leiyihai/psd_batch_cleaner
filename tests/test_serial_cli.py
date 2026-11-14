@@ -6,11 +6,24 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import Any
 
 from test_prototype import tiny, embedded
 
 
 class SerialCliTests(unittest.TestCase):
+    def invoke(self, *arguments: str, env: dict[str, str] | None = None,
+               bootstrap: str | None = None) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, '-c', bootstrap] if bootstrap is not None else [sys.executable, '-m', 'prototype.batch']
+        return subprocess.run([*command, *arguments], env={**os.environ, 'PYTHONUTF8': '1', **(env or {})},
+                              capture_output=True, text=True, encoding='utf-8', timeout=30)
+
+    def terminal(self, result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        self.assertTrue(result.stdout.strip(), result.stderr)
+        payload = json.loads(result.stdout.splitlines()[-1])
+        self.assertIsInstance(payload, dict)
+        return payload
+
     def test_task_errors_have_exit_two_readable_error_and_machine_terminal_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -28,13 +41,11 @@ class SerialCliTests(unittest.TestCase):
                     elif kind == 'cache':
                         manifest.write_text('broken JSON', encoding='utf-8')
                     selected = base / 'missing-input' if kind == 'missing' else inputs
-                    result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(selected),
-                                             '--output', str(output)], env={**os.environ, 'PYTHONUTF8': '1'},
-                                            capture_output=True, text=True, encoding='utf-8', timeout=30)
+                    result = self.invoke('--input', str(selected), '--output', str(output))
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn('任务异常', result.stderr)
                     self.assertNotIn('Traceback', result.stderr)
-                    terminal = json.loads(result.stdout.splitlines()[-1])
+                    terminal = self.terminal(result)
                     self.assertEqual((terminal['state'], terminal['exit_code'], terminal['completed']), ('error', 2, 0))
                     self.assertIsNone(terminal['total'])
                     self.assertIsNone(terminal['report'])
@@ -55,12 +66,10 @@ class SerialCliTests(unittest.TestCase):
             original = tiny()
             source = inputs / '设计🎨.PSD'
             source.write_bytes(original)
-            result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs),
-                                     '--output', str(output)],
-                                    env={**os.environ, 'PYTHONIOENCODING': 'ascii', 'PYTHONUTF8': '0'},
-                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            result = self.invoke('--input', str(inputs), '--output', str(output),
+                                 env={'PYTHONIOENCODING': 'ascii', 'PYTHONUTF8': '0'})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            terminal = json.loads(result.stdout.splitlines()[-1])
+            terminal = self.terminal(result)
             self.assertEqual((terminal['state'], terminal['exit_code'], terminal['completed'], terminal['total']),
                              ('finished', 0, 1, 1))
             self.assertEqual(terminal['counts']['成功'], 1)
@@ -76,12 +85,9 @@ class SerialCliTests(unittest.TestCase):
             (inputs / '00-bad.psd').write_bytes(b'broken')
             (inputs / '01-partial.psd').write_bytes(tiny(children=[embedded(b'%PDF opaque')]))
             (inputs / '02-normal.psb').write_bytes(tiny(2, xmp=None))
-            result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs),
-                                     '--output', str(output)],
-                                    env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONPROFILEIMPORTTIME': '1'},
-                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            result = self.invoke('--input', str(inputs), '--output', str(output), env={'PYTHONPROFILEIMPORTTIME': '1'})
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            terminal = json.loads(result.stdout.splitlines()[-1])
+            terminal = self.terminal(result)
             self.assertEqual((terminal['state'], terminal['exit_code'], terminal['completed'], terminal['total']),
                              ('finished', 1, 3, 3))
             self.assertEqual(terminal['counts']['失败'], 1)
@@ -98,18 +104,14 @@ class SerialCliTests(unittest.TestCase):
             base = Path(temporary)
             inputs, output = base / 'input', base / 'output'
             inputs.mkdir()
-            result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs),
-                                     '--output', str(output)], env={**os.environ, 'PYTHONUTF8': '1'},
-                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            result = self.invoke('--input', str(inputs), '--output', str(output))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            terminal = json.loads(result.stdout.splitlines()[-1])
+            terminal = self.terminal(result)
             self.assertEqual((terminal['state'], terminal['completed'], terminal['total']), ('finished', 0, 0))
             self.assertEqual(json.loads(Path(terminal['report']).read_text(encoding='utf-8')), [])
 
     def test_help_is_usable_even_when_scheduler_inherits_ascii_output(self):
-        result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--help'],
-                                env={**os.environ, 'PYTHONIOENCODING': 'ascii', 'PYTHONUTF8': '0'},
-                                capture_output=True, text=True, encoding='utf-8', timeout=30)
+        result = self.invoke('--help', env={'PYTHONIOENCODING': 'ascii', 'PYTHONUTF8': '0'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('串行批处理', result.stdout)
         self.assertIn('--no-recursive', result.stdout)
@@ -125,11 +127,10 @@ class SerialCliTests(unittest.TestCase):
             fixtures = {'00-bad.psd': b'broken', '01-valid.psd': tiny(), '02-next.psd': tiny()}
             for name, content in fixtures.items():
                 (inputs / name).write_bytes(content)
-            result = subprocess.run([sys.executable, '-c', bootstrap, '--input', str(inputs), '--output', str(output)],
-                                    env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONPATH': str(Path(__file__).parent)},
-                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            result = self.invoke('--input', str(inputs), '--output', str(output), bootstrap=bootstrap,
+                                 env={'PYTHONPATH': str(Path(__file__).parent)})
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-            terminal = json.loads(result.stdout.splitlines()[-1])
+            terminal = self.terminal(result)
             self.assertEqual((terminal['state'], terminal['exit_code'], terminal['completed'], terminal['total']),
                              ('error', 2, 2, 3))
             self.assertEqual(terminal['counts']['失败'], 1)
@@ -142,11 +143,9 @@ class SerialCliTests(unittest.TestCase):
             original_output = published.read_bytes()
             self.assertFalse(list(output.glob('*/files/02-next.psd')))
             self.assertFalse((output / '.cleaner.lock').exists())
-            retried = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs), '--output', str(output)],
-                                     env={**os.environ, 'PYTHONUTF8': '1'},
-                                     capture_output=True, text=True, encoding='utf-8', timeout=30)
+            retried = self.invoke('--input', str(inputs), '--output', str(output))
             self.assertEqual(retried.returncode, 1, retried.stdout + retried.stderr)
-            final = json.loads(retried.stdout.splitlines()[-1])
+            final = self.terminal(retried)
             rows = json.loads(Path(final['report']).read_text(encoding='utf-8'))
             self.assertEqual([row['status'] for row in rows], ['失败', '未变化', '成功'])
             self.assertEqual(report.read_bytes(), durable)
@@ -163,11 +162,9 @@ class SerialCliTests(unittest.TestCase):
             original = tiny(children=[embedded(b'%PDF opaque')])
             source.write_bytes(original)
             (inputs / 'b-正常.psb').write_bytes(tiny(2, xmp=None))
-            result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs),
-                                     '--output', str(output)], env={**os.environ, 'PYTHONUTF8': '1'},
-                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            result = self.invoke('--input', str(inputs), '--output', str(output))
             self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-            terminal = json.loads(result.stdout.splitlines()[-1])
+            terminal = self.terminal(result)
             self.assertEqual((terminal['state'], terminal['exit_code'], terminal['completed'], terminal['total']),
                              ('finished', 3, 2, 2))
             self.assertEqual(terminal['counts']['部分清理'], 1)
