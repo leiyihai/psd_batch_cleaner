@@ -6,6 +6,8 @@ import io
 import json
 import threading
 import os
+import subprocess
+import sys
 from unittest.mock import patch
 from pathlib import Path
 import tempfile
@@ -56,6 +58,138 @@ class GuiTests(unittest.TestCase):
             self.root.update()
             time.sleep(.01)
         self.assertTrue(event.is_set(), 'filesystem gate was not entered')
+
+    def test_serial_release_full_workflow_matches_cli_and_preserves_history(self):
+        deep = tiny(children=[embedded(tiny(2, children=[embedded(tiny())]))])
+        fixtures = {'00-bad.psd': b'broken', '01-deep.PSD': deep,
+                    'A/01-same.PsB': tiny(2, xmp=None),
+                    'A/02-partial.psd': tiny(children=[embedded(b'%PDF opaque')]),
+                    'B/01-same.psd': tiny()}
+        for relative, content in fixtures.items():
+            path = self.inputs / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        (self.inputs / '空目录').mkdir()
+        (self.inputs / 'ignore.jpg').write_bytes(b'not input')
+        with patch('tkinter.filedialog.askdirectory', side_effect=[str(self.inputs), str(self.output)]):
+            self.app.input_browse.invoke()
+            self.app.output_browse.invoke()
+        self.assertTrue(self.app.recursive.get())
+        archived: dict[Path, bytes] = {}
+
+        def export_round(name):
+            destination = self.base / f'08-{name}.json'
+            with patch('tkinter.filedialog.asksaveasfilename', return_value=str(destination)):
+                self.app.export_button.invoke()
+                self.finish()
+            payload = json.loads(destination.read_text(encoding='utf-8'))
+            if payload['task']['source_report']:
+                report = Path(payload['task']['source_report'])
+                self.assertEqual(json.loads(report.read_text(encoding='utf-8')), payload['results'])
+                archived.setdefault(report, report.read_bytes())
+            for row in payload['results']:
+                if row['output']:
+                    path = Path(row['output'])
+                    archived.setdefault(path, path.read_bytes())
+            for path, content in archived.items():
+                self.assertEqual(path.read_bytes(), content, f'historical artifact changed: {path}')
+            return payload
+
+        def execute(name):
+            self.app.start_button.invoke()
+            self.finish()
+            return export_round(name)
+
+        first = execute('first')
+        self.assertEqual([row['status'] for row in first['results']], ['失败', '成功', '无需清理', '部分清理', '成功'])
+        self.assertEqual((first['results'][1]['documents'], first['results'][1]['removed']), (3, 3))
+        report_root = Path(first['task']['source_report']).parent
+        self.assertTrue((report_root / 'files/A/01-same.PsB').is_file())
+        self.assertTrue((report_root / 'files/B/01-same.psd').is_file())
+        second = execute('repeat')
+        self.assertEqual([row['status'] for row in second['results']], ['失败', '未变化', '未变化', '部分清理', '未变化'])
+        self.assertEqual(second['summary']['counted_files'], 1)
+        self.assertNotEqual(first['results'][3]['output'], second['results'][3]['output'])
+        source = self.inputs / '01-deep.PSD'
+        before = source.stat()
+        updated = deep.replace(b'Shanghai', b'Shenzhen')
+        source.write_bytes(updated)
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        fixtures['01-deep.PSD'] = updated
+        changed = execute('input-updated')
+        self.assertEqual(changed['results'][1]['status'], '成功')
+        self.assertNotEqual(changed['results'][1]['output'], first['results'][1]['output'])
+        manifest = self.output / '.cleaner-cache.json'
+        records = json.loads(manifest.read_text(encoding='utf-8'))
+        for record in records.values():
+            record['rule'] = 'previous-serial-rule'
+        manifest.write_text(json.dumps(records), encoding='utf-8')
+        upgraded = execute('rule-upgraded')
+        self.assertEqual([row['status'] for row in upgraded['results']], ['失败', '成功', '无需清理', '部分清理', '成功'])
+        damaged_output = Path(upgraded['results'][2]['output'])
+        damaged_output.write_bytes(b'intentionally damaged output')
+        archived[damaged_output] = damaged_output.read_bytes()
+        repaired = execute('output-repaired')
+        self.assertEqual(repaired['results'][2]['status'], '无需清理')
+        self.assertNotEqual(repaired['results'][2]['output'], str(damaged_output))
+        lock = self.output / '.cleaner.lock'
+        lock.write_text('integration-owned simulated conflict', encoding='utf-8')
+        try:
+            blocked = execute('task-error')
+            self.assertEqual(blocked['task']['state'], 'error')
+            self.assertEqual(blocked['results'], [])
+            self.assertEqual(lock.read_text(encoding='utf-8'), 'integration-owned simulated conflict')
+        finally:
+            lock.unlink()  # This test, not the cleaner, owns the simulated lock.
+        entered, release = threading.Event(), threading.Event()
+        path_open = Path.open
+
+        def hold_current_file(path, mode='r', *args, **kwargs):
+            if mode == 'rb' and path == source.resolve():
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError('integrated stop gate timed out')
+            return path_open(path, mode, *args, **kwargs)
+
+        with patch('pathlib.Path.open', new=hold_current_file):
+            self.app.start_button.invoke()
+            try:
+                self.wait_for(entered)
+                self.app.stop_button.invoke()
+                self.assertEqual(self.app.phase.get(), '请求停止')
+                self.assertTrue(self.app.start_button.instate(['disabled']))
+            finally:
+                release.set()
+                self.finish()
+        stopped = export_round('stopped')
+        self.assertEqual((stopped['task']['state'], stopped['task']['completed'], stopped['task']['total']), ('stopped', 2, 5))
+        self.assertEqual([Path(row['source']).name for row in stopped['results']], ['00-bad.psd', '01-deep.PSD'])
+        resumed = execute('resumed')
+        self.assertEqual((resumed['task']['state'], resumed['task']['completed'], resumed['task']['total']), ('finished', 5, 5))
+        cli_output = self.base / 'independent-cli'
+        cli_rows = []
+        for iteration in range(2):
+            result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(self.inputs),
+                                     '--output', str(cli_output)], env={**os.environ, 'PYTHONUTF8': '1'},
+                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            terminal = json.loads(result.stdout.splitlines()[-1])
+            self.assertEqual((terminal['state'], terminal['completed'], terminal['total']), ('finished', 5, 5))
+            cli_rows = json.loads(Path(terminal['report']).read_text(encoding='utf-8'))
+            if iteration:
+                self.assertEqual([row['status'] for row in cli_rows], ['失败', '未变化', '未变化', '部分清理', '未变化'])
+        for gui_row, cli_row in zip(resumed['results'], cli_rows):
+            self.assertEqual(gui_row['source'], cli_row['source'])
+            if gui_row['output']:
+                self.assertEqual(Path(gui_row['output']).read_bytes(), Path(cli_row['output']).read_bytes())
+            else:
+                self.assertIsNone(cli_row['output'])
+        for relative, content in fixtures.items():
+            self.assertEqual((self.inputs / relative).read_bytes(), content)
+        for path, content in archived.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(lock.exists())
+        self.assertFalse((cli_output / '.cleaner.lock').exists())
 
     def test_result_details_and_classified_statistics_use_real_batch_records(self):
         historical_source = self.inputs / 'c-历史.psd'

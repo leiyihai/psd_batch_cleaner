@@ -34,6 +34,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m prototype.batch --input "D:\输入" --output "D:\独立输出"
 ```
 
+**CLI 退出码：`0` 正常、`1` 单文件失败、`2` 任务异常、`3` 部分清理**，任务异常优先、文件失败优先于部分清理；非 0 不应被外部计划任务当作完整成功。stdout/stderr 为 UTF-8，正常终态的最后一行 stdout 为 JSON；任务被外围强杀/超时、缺少终态时也不能视为通过。安装、完整退出码约定、任务计划程序参数、日志与故障复查见 [串行运行指南](docs/serial-running.md)。本工具不自动注册定时任务。
+
 CLI 默认扫描子文件夹，识别 PSD/PSB 及混合大小写扩展名；传入 `--no-recursive` 仅扫描当前层级（`--recursive` 显式开启）。GUI 与 CLI 共用相同范围参数及扫描行为，不进入符号链接或 Windows 目录联接。每次运行创建独立输出子目录；增量命中返回历史输出引用，并不在本轮重复复制一套结果。请避免在处理期间修改输入文件。
 
 重复运行会完整读盘计算源文件及历史副本的 SHA-256，不承诺零耗时跳过。GUI 显示“检查变化”，命中时显示“未变化”、历史复用数量与实际历史路径；选择结果可查看“复用历史副本”说明。**本轮目录不一定是一套完整副本**，历史命中不会重复解析、清理、保存或复制到本轮目录，实际输出以逐文件路径为准。源内容（包括同大小同时间修改）、规则变化、历史输出丢失或哈希不符时生成新副本；失败和部分清理下次仍重试。
@@ -83,6 +85,8 @@ CLI 默认扫描子文件夹，识别 PSD/PSB 及混合大小写扩展名；传�
 - [05 最终验收](docs/ticket05-closeout.md)：安全停止、文件失败与任务异常分流、锁冲突及恢复重启
 - [06 最终验收](docs/ticket06-closeout.md)：增量复用说明、缓存安全校验、失效及输入并发修改验收
 - [07 最终验收](docs/ticket07-closeout.md)：完整详情、保守收益统计、中文 JSON 导出与故障恢复
+- [08 整体验收](docs/ticket08-closeout.md)：同一套真实样本的 GUI/CLI、Photoshop、资源与超时记录
+- [串行运行指南](docs/serial-running.md)：安装、外部定期执行、退出码、日志和遗留锁处理
 - [历史小样本验证](docs/prototype-validation.md)：早期记录，不代表当前批处理限制
 - [文件区间补丁 ADR](docs/adr/0001-stream-metadata-patches.md)
 - [规格与工单导航](docs/spec-psd-batch-cleaner.md)

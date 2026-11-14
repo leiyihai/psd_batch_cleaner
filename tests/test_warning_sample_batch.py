@@ -40,7 +40,7 @@ class WarningSampleBatchTests(unittest.TestCase):
             cwd=Path(__file__).resolve().parents[1],
             env={**os.environ, 'PYTHONUTF8': '1'}, capture_output=True, text=True, encoding='utf-8', timeout=180,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         reports = list(output.glob('*/report.json'))
         self.assertEqual(len(reports), 1)
         rows = json.loads(reports[0].read_text(encoding='utf-8'))

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path, PureWindowsPath
 import tempfile
 import threading
@@ -263,16 +264,53 @@ def _run(input_dir: Path, output_dir: Path, *, notify: Callable[[BatchEvent], No
         lock.unlink(missing_ok=True)
 
 
-def main():
+def main() -> int:
+    # Apply to argparse help/errors too, before it can write Unicode text.
+    for console in (sys.stdout, sys.stderr):
+        configure = getattr(console, 'reconfigure', None)
+        if configure is not None:
+            configure(encoding='utf-8', errors='backslashreplace')
     parser = argparse.ArgumentParser(description="PSD/PSB 串行批处理：生成独立瘦身副本")
     parser.add_argument("--input", type=Path, required=True, help="输入目录，扫描 PSD/PSB")
     parser.add_argument("--output", type=Path, required=True, help="独立输出目录；每次运行生成新子目录")
     parser.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True,
                         help='包含子文件夹（默认开启）；--no-recursive 仅扫描当前层级')
     args = parser.parse_args()
-    rows, report = run(args.input, args.output, recursive=args.recursive)
-    print(f"结果报告：{report}")
-    return 1 if any(row["status"] == "失败" for row in rows) else 0
+    from prototype.results import summarize
+
+    observed: list[dict[str, Any]] = []
+    report: Path | None = None
+    total: int | None = None
+
+    def receive(event: BatchEvent) -> None:
+        nonlocal report, total
+        if event.total is not None:
+            total = event.total
+        if event.report is not None:
+            report = event.report
+        if event.kind == 'file' and event.row is not None:
+            observed.append(event.row)
+
+    state, message, code = 'finished', '', 0
+    try:
+        rows, report = run(args.input, args.output, recursive=args.recursive, on_event=receive)
+    except Exception as exc:
+        rows = observed
+        state, message, code = 'error', str(exc), 2
+        print(f'任务异常：{message}', file=sys.stderr)
+    else:
+        if any(row['status'] == '失败' for row in rows):
+            code = 1
+        elif any(row['status'] == '部分清理' for row in rows):
+            code = 3
+    if report is not None:
+        print(f'结果报告：{report}')
+    # Last stdout line is a stable machine-readable terminal record, even when
+    # only a previously saved partial report remains after a task-level error.
+    print(json.dumps({'state': state, 'exit_code': code, 'completed': len(rows), 'total': total,
+                      'counts': summarize(rows).counts, 'report': str(report) if report is not None else None,
+                      'message': message}, ensure_ascii=True))
+    return code
 
 
 if __name__ == "__main__":

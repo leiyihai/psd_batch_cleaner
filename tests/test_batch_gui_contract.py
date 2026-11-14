@@ -59,7 +59,7 @@ class BatchGuiContractTests(unittest.TestCase):
             (inputs / 'ignore.txt').write_text('not an input')
             for recursive, expected in ((False, 1), (True, 2)):
                 with self.subTest(recursive=recursive):
-                    events = []
+                    events: list[BatchEvent] = []
                     rows, _ = run(inputs, base / str(recursive), recursive=recursive,
                                   on_event=events.append, emit=lambda _: None)
                     scanned = next(event for event in events if event.kind == 'scanned')
@@ -69,7 +69,7 @@ class BatchGuiContractTests(unittest.TestCase):
                     self.assertEqual(progress, [(1, 1)] if not recursive else [(1, 2), (2, 2)])
                     self.assertEqual((events[-1].completed, events[-1].total), (expected, expected))
                     self.assertEqual(len(rows), expected)
-            selected_events = []
+            selected_events: list[BatchEvent] = []
             run(inputs, base / 'selected', selected_files={second},
                 on_event=selected_events.append, emit=lambda _: None)
             self.assertEqual(next(e.total for e in selected_events if e.kind == 'scanned'), 1)
@@ -82,13 +82,13 @@ class BatchGuiContractTests(unittest.TestCase):
             denied.mkdir(parents=True)
             original = tiny()
             (denied / 'hidden.psd').write_bytes(original)
-            events = []
+            events: list[BatchEvent] = []
             scandir = os.scandir
 
             @contextmanager
             def inaccessible_entry(path):
                 with scandir(path) as entries:
-                    replaced = []
+                    replaced: list[os.DirEntry[str] | Mock] = []
                     for entry in entries:
                         if Path(entry.path) == denied.resolve():
                             blocked = Mock(wraps=entry)
@@ -124,7 +124,7 @@ class BatchGuiContractTests(unittest.TestCase):
             old_report_bytes = old_report.read_bytes()
             scandir = os.scandir
             for error in (PermissionError('无权限扫描目录'), OSError('扫描设备错误')):
-                events = []
+                events: list[BatchEvent] = []
 
                 def unavailable(path):
                     if Path(path) == denied.resolve():
@@ -156,7 +156,7 @@ class BatchGuiContractTests(unittest.TestCase):
                 (inputs / 'cycle').symlink_to(inputs, target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f'symlink creation unavailable: {exc}')
-            events = []
+            events: list[BatchEvent] = []
             rows, report = run(inputs, base / 'output', on_event=events.append, emit=lambda _: None)
             self.assertEqual(rows, [])
             self.assertEqual(json.loads(report.read_text(encoding='utf-8')), [])
@@ -173,7 +173,7 @@ class BatchGuiContractTests(unittest.TestCase):
             (inputs / 'a.psd').write_bytes(original)
             for output in (inputs, inputs / 'output', base):
                 with self.subTest(output=output):
-                    events = []
+                    events: list[BatchEvent] = []
                     with self.assertRaisesRegex(ValueError, '不能相互包含'):
                         run(inputs, output, on_event=events.append, emit=lambda _: None)
                     self.assertEqual(events[-1].kind, 'error')
@@ -211,8 +211,10 @@ class BatchGuiContractTests(unittest.TestCase):
             (inputs / '子目录' / 'b.psb').write_bytes(tiny(2))
             result = subprocess.run([sys.executable, '-m', 'prototype.batch', '--input', str(inputs),
                                      '--output', str(base / 'output'), '--no-recursive'],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, encoding='utf-8', timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('输入 空格', result.stdout)
+            self.assertEqual(json.loads(result.stdout.splitlines()[-1])['total'], 1)
             report = next((base / 'output').glob('*/report.json'))
             self.assertEqual(len(json.loads(report.read_text(encoding='utf-8'))), 1)
 
